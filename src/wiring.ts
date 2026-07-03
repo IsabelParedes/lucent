@@ -36,6 +36,12 @@ export interface RHostApi {
   stop(): void | Promise<void>;
 }
 
+/** Reverse delivery API the service worker exposes to the R worker (Comlink target). */
+export interface SwDeliveryApi {
+  deliverHttpResponse(resp: unknown): void | Promise<void>;
+  deliverWsPush(msg: unknown): void | Promise<void>;
+}
+
 /**
  * Broker a single Comlink MessagePort between the service worker and R worker.
  * The SW creates a reverse delivery channel after wrapping the worker API.
