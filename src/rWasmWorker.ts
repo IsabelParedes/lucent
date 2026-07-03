@@ -15,6 +15,26 @@ import { createRHostApi, type HostInboundMessage, type SwDeliveryApi } from "./w
 const workerSelf = self as unknown as DedicatedWorkerGlobalScope;
 const config = resolveLucentConfig();
 
+// Unthrottled macrotask primitive. A MessageChannel task is not subject to the
+// nested-setTimeout 4ms clamp or the background-tab timer throttling that would
+// otherwise stretch every reactive hop (drain scheduling, HTTP push drain, and
+// the idle service pump) once the tab is hidden. Order is preserved because a
+// MessagePort delivers messages FIFO.
+const macrotaskChannel = new MessageChannel();
+const macrotaskQueue: Array<() => void> = [];
+macrotaskChannel.port1.onmessage = () => {
+  const cb = macrotaskQueue.shift();
+  if (cb) {
+    cb();
+  }
+};
+
+/** Run `cb` on the next macrotask turn without timer clamping/throttling. */
+function scheduleMacrotask(cb: () => void): void {
+  macrotaskQueue.push(cb);
+  macrotaskChannel.port2.postMessage(0);
+}
+
 interface RTask {
   work: () => void;
   resolve: () => void;
@@ -85,8 +105,21 @@ let activeHttpDrainUuid: string | null = null;
 const httpDrainByUuid = new Map<string, { resolved: boolean }>();
 let httpDeliveryInflight = 0;
 
-const R_LATER_PUMP_MS = 16;
-let rLaterPumpActive = false;
+/** Minimum spacing between idle service ticks (a real evalR is expensive). */
+const PUMP_INTERVAL_MS = 16;
+
+/** Keep the pump on the unthrottled macrotask loop this long after activity. */
+const ACTIVE_WINDOW_MS = 2_000;
+
+/** Idle-backoff cadence: once quiet, a plain timer is fine (nothing to pump). */
+const IDLE_PUMP_MS = 96;
+
+let pumpStarted = false;
+let pumpScheduled = false;
+let pumpViaMacrotask = false;
+let pumpTimer: ReturnType<typeof setTimeout> | null = null;
+let lastActivityTs = 0;
+let lastPumpTickTs = 0;
 
 let transport: HttpuvTransport | null = null;
 let rModule: RModule | null = null;
@@ -158,6 +191,7 @@ function deliverToServiceWorker(outbound: OutboundMessage, transfer: Transferabl
     console.warn("[rWasmWorker] Service worker delivery API not connected");
     return;
   }
+  markActivity();
 
   if (outbound.type === t.MSG.HTTP_RESPONSE) {
     dbg("comlink-deliver-http", { uuid: outbound.uuid, status: outbound.status });
@@ -231,7 +265,7 @@ function scheduleRDrain(): void {
     return;
   }
   rDrainScheduled = true;
-  setTimeout(drainRTaskQueue, 0);
+  scheduleMacrotask(drainRTaskQueue);
 }
 
 function drainRTaskQueue(): void {
@@ -465,40 +499,91 @@ function drainAfterHttpPush(
     return Promise.resolve();
   }
   return new Promise((resolve) => {
-    setTimeout(() => {
+    scheduleMacrotask(() => {
       void enqueueRTask(() => {
         evalRNow(WASM_HTTP_DRAIN_TICK);
       })
         .then(() => drainAfterHttpPush(roundsLeft - 1, uuid, state))
         .then(resolve);
-    }, HTTP_DRAIN_YIELD_MS);
+    });
   });
 }
 
-function scheduleRLaterPump(): void {
-  if (rLaterPumpActive) {
+/**
+ * Idle service pump. While there has been recent traffic it rides the
+ * unthrottled macrotask loop (surviving background throttling); once quiet it
+ * backs off to a plain timer so an idle app costs nothing. Real evalR ticks are
+ * still spaced by PUMP_INTERVAL_MS; the macrotask turns in between are cheap.
+ */
+function schedulePump(viaMacrotask: boolean, delayMs = 0): void {
+  if (pumpScheduled) {
     return;
   }
-  rLaterPumpActive = true;
-  setTimeout(() => {
-    rLaterPumpActive = false;
-    if (!rModule) {
-      return;
-    }
-    if (!rLocked && rTaskQueue.length === 0 && !httpDeliveryActive) {
-      void enqueueRTask(() => {
-        evalRNow(WASM_SINGLE_SERVICE_TICK);
-      }).catch((err) => {
-        console.warn("[rWasmWorker] later pump failed:", formatRWasmError(err));
-      });
-    }
-    scheduleRLaterPump();
-  }, R_LATER_PUMP_MS);
+  pumpScheduled = true;
+  pumpViaMacrotask = viaMacrotask;
+  if (viaMacrotask) {
+    scheduleMacrotask(() => {
+      pumpScheduled = false;
+      pumpOnce();
+    });
+  } else {
+    pumpTimer = setTimeout(() => {
+      pumpTimer = null;
+      pumpScheduled = false;
+      pumpOnce();
+    }, delayMs);
+  }
+}
+
+function pumpOnce(): void {
+  if (!rModule) {
+    return;
+  }
+
+  const now = Date.now();
+  if (
+    now - lastPumpTickTs >= PUMP_INTERVAL_MS &&
+    !rLocked &&
+    rTaskQueue.length === 0 &&
+    !httpDeliveryActive
+  ) {
+    lastPumpTickTs = now;
+    void enqueueRTask(() => {
+      evalRNow(WASM_SINGLE_SERVICE_TICK);
+    }).catch((err) => {
+      console.warn("[rWasmWorker] later pump failed:", formatRWasmError(err));
+    });
+  }
+
+  const active =
+    now - lastActivityTs < ACTIVE_WINDOW_MS ||
+    httpDeliveryInflight > 0 ||
+    httpDeliveryQueue.length > 0;
+  schedulePump(active, active ? 0 : IDLE_PUMP_MS);
+}
+
+/**
+ * Note inbound/outbound traffic so the pump re-enters the unthrottled macrotask
+ * loop promptly (rather than waiting out the current idle-backoff timer).
+ */
+function markActivity(): void {
+  lastActivityTs = Date.now();
+  if (pumpStarted && !pumpViaMacrotask && pumpTimer !== null) {
+    clearTimeout(pumpTimer);
+    pumpTimer = null;
+    pumpScheduled = false;
+    schedulePump(true, 0);
+  }
 }
 
 function ensureRLaterPump(): void {
-  scheduleRLaterPump();
-  dbg("later-pump", { intervalMs: R_LATER_PUMP_MS });
+  if (pumpStarted) {
+    return;
+  }
+  pumpStarted = true;
+  lastActivityTs = Date.now();
+  schedulePump(true, 0);
+  dbg("later-pump", { intervalMs: PUMP_INTERVAL_MS, driver: "message-loop" });
 }
 
 function logHttpDeliveryError(err: unknown): void {
@@ -510,6 +595,7 @@ function logHttpDeliveryError(err: unknown): void {
  * service loop is suspended once for the whole batch.
  */
 function enqueueHttpDelivery(req: HostInboundMessage): Promise<void> {
+  markActivity();
   dbg("worker-push", { uuid: req.uuid, method: req.method, url: req.url });
 
   return new Promise((resolve, reject) => {
@@ -656,6 +742,8 @@ async function onMessage(event: MessageEvent): Promise<void> {
   if (!data || typeof data.type !== "string") {
     return;
   }
+
+  markActivity();
 
   switch (data.type) {
     case RWASM.INIT: {
