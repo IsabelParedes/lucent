@@ -1,4 +1,4 @@
-import { resolveLucentConfig, type LucentConfig } from "./config";
+import { LUCENT_CONFIG_PARAM, resolveLucentConfig, type LucentConfig } from "./config";
 import { RWASM } from "./rwasm-constants";
 import { loadTransport, type HttpuvTransport } from "./transport";
 import { connectHttpuvComlink } from "./wiring";
@@ -36,18 +36,35 @@ function requireTransport(): HttpuvTransport {
   return transport;
 }
 
+/**
+ * Absolute base URL under which the Shiny app is mounted. Deliberately NOT
+ * derived from import.meta.url (the bundle lives in /lucent/dist/, which would
+ * collide with real static files); defaults to the origin root → `/shiny/`.
+ */
+function shinyBaseUrl(): string {
+  return new URL(config.shinyBaseUrl, self.location.href).href;
+}
+
+function shinyPrefix(): string {
+  return requireTransport().resolveShinyPrefix(shinyBaseUrl());
+}
+
 function appUrl(subpath = ""): string {
-  return requireTransport().shinyAppUrl(subpath, import.meta.url);
+  return requireTransport().shinyAppUrl(subpath, shinyBaseUrl());
 }
 
 function serviceWorkerScriptUrl(): URL {
   const base = new URL(config.transportBaseUrl, self.location.href);
-  return new URL("httpuv-sw.js", base);
+  const url = new URL("httpuv-sw.js", base);
+  // Tell the SW its mount prefix up-front so it intercepts correctly before the
+  // REGISTER_HOST message arrives (avoids a first-load race on asset requests).
+  url.searchParams.set("shinyPrefix", shinyPrefix());
+  return url;
 }
 
 function announceHostToServiceWorker(): boolean {
   const t = requireTransport();
-  const prefix = t.resolveShinyPrefix(import.meta.url);
+  const prefix = shinyPrefix();
   const msg = { type: t.MSG.REGISTER_HOST, shinyPrefix: prefix };
   const controller = navigator.serviceWorker.controller;
   if (controller) {
@@ -166,7 +183,7 @@ async function registerHttpuvServiceWorker(): Promise<ServiceWorkerRegistration 
     announceHostToServiceWorker();
     console.info("[httpuv] Service worker registered", {
       scope: reg.scope,
-      shinyPrefix: requireTransport().resolveShinyPrefix(import.meta.url),
+      shinyPrefix: shinyPrefix(),
       controller: Boolean(navigator.serviceWorker.controller),
     });
     return reg;
@@ -225,8 +242,28 @@ function postToRWorker(
   });
 }
 
+/**
+ * Serialize the host's resolved config into an absolute-URL payload for the
+ * worker. Base URLs are made absolute against the host page so the worker (which
+ * lives at a different path, /lucent/dist/) resolves them identically — the host
+ * is the single source of truth for config.
+ */
+function workerConfigParam(): string {
+  const base = self.location.href;
+  const abs = (u?: string): string | undefined => (u == null ? undefined : new URL(u, base).href);
+  const payload: Partial<LucentConfig> = {
+    transportBaseUrl: abs(config.transportBaseUrl),
+    rRuntimeBaseUrl: abs(config.rRuntimeBaseUrl),
+    shinyBaseUrl: abs(config.shinyBaseUrl),
+    appDirUrl: abs(config.appDirUrl),
+    appManifestUrl: abs(config.appManifestUrl),
+  };
+  return JSON.stringify(payload);
+}
+
 function createRWorker(): Promise<Worker> {
   const workerUrl = new URL("./rWasmWorker.js", import.meta.url);
+  workerUrl.searchParams.set(LUCENT_CONFIG_PARAM, workerConfigParam());
   if (requireTransport().isHttpuvDebug()) {
     workerUrl.searchParams.set("httpuvDebug", "1");
   }
@@ -307,7 +344,7 @@ function reconnectComlinkAfterServiceWorkerUpdate(): void {
 export async function ensureHttpuvReady(): Promise<void> {
   if (!httpuvReadyPromise) {
     const t = requireTransport();
-    t.setShinyPrefix(t.resolveShinyPrefix(import.meta.url));
+    t.setShinyPrefix(shinyPrefix());
     httpuvReadyPromise = ensureComlinkConnected();
   }
   return httpuvReadyPromise;
@@ -371,10 +408,60 @@ async function waitForShinyHttpReady(worker: Worker): Promise<void> {
   await syncResourcePathsToServiceWorker(worker);
 }
 
-export async function runApp(code: string): Promise<number> {
-  const trimmed = code.trim();
-  if (!trimmed) {
-    console.warn("[runApp] No R code to run");
+interface AppFile {
+  path: string;
+  data: Uint8Array;
+}
+
+function appDirUrl(): string {
+  return config.appDirUrl ?? new URL("webApp/", self.location.href).href;
+}
+
+/**
+ * Resolve the list of app files. A browser cannot enumerate a directory over
+ * HTTP, so we rely on a `manifest.json` ({ files: string[] }) alongside the app.
+ * The local dev server (serve.mjs) generates this automatically; static hosts
+ * can ship one. Falls back to a lone `app.R` if no manifest is available.
+ */
+async function fetchAppFileList(dirUrl: string): Promise<string[]> {
+  const manifestUrl = config.appManifestUrl ?? new URL("manifest.json", dirUrl).href;
+  try {
+    const res = await fetch(manifestUrl, { cache: "no-store" });
+    if (res.ok) {
+      const data = (await res.json()) as { files?: unknown };
+      if (Array.isArray(data.files) && data.files.length > 0) {
+        return data.files.filter((f): f is string => typeof f === "string");
+      }
+      console.warn(`[runApp] app manifest ${manifestUrl} had no files; falling back to app.R`);
+    } else {
+      console.warn(`[runApp] app manifest ${manifestUrl} → HTTP ${res.status}; falling back to app.R`);
+    }
+  } catch (err) {
+    console.warn("[runApp] app manifest fetch failed; falling back to app.R", err);
+  }
+  return ["app.R"];
+}
+
+async function loadAppFiles(): Promise<AppFile[]> {
+  const dirUrl = appDirUrl();
+  const list = await fetchAppFileList(dirUrl);
+  const files = await Promise.all(
+    list.map(async (rel): Promise<AppFile> => {
+      const fileUrl = new URL(rel, dirUrl);
+      const res = await fetch(fileUrl, { cache: "no-store" });
+      if (!res.ok) {
+        throw new Error(`Failed to fetch app file ${fileUrl.href}: HTTP ${res.status}`);
+      }
+      return { path: rel, data: new Uint8Array(await res.arrayBuffer()) };
+    }),
+  );
+  console.info("[runApp] loaded", files.length, "app file(s) from", dirUrl);
+  return files;
+}
+
+export async function runApp(files: AppFile[]): Promise<number> {
+  if (files.length === 0) {
+    console.warn("[runApp] No app files to run");
     return 1;
   }
 
@@ -383,10 +470,8 @@ export async function runApp(code: string): Promise<number> {
   clearAppDocumentCache();
   await postToRWorker(worker, { type: RWASM.STOP_APP });
 
-  await postToRWorker(worker, {
-    type: RWASM.WRITE_WEB_APP,
-    source: trimmed,
-  });
+  const transfer = files.map((f) => f.data.buffer as ArrayBuffer);
+  await postToRWorker(worker, { type: RWASM.WRITE_WEB_APP_FILES, files }, transfer);
 
   console.info("[runApp] worker eval", RUN_WEB_APP_R);
   await postToRWorker(worker, {
@@ -397,20 +482,11 @@ export async function runApp(code: string): Promise<number> {
   return 0;
 }
 
-async function loadAppSource(): Promise<string> {
-  const url = config.appSourceUrl ?? new URL("webApp/app.R", self.location.href).href;
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) {
-    throw new Error(`Failed to fetch app source ${url}: HTTP ${res.status}`);
-  }
-  return res.text();
-}
-
 async function startShinyApp(): Promise<void> {
   await ensureHttpuvReady();
   const worker = await ensureRWorker();
-  const source = await loadAppSource();
-  await runApp(source);
+  const files = await loadAppFiles();
+  await runApp(files);
   await waitForShinyHttpReady(worker);
   await ensureComlinkConnected();
   loadViewerFrame();
@@ -474,7 +550,7 @@ function installGlobalHelpers(): void {
 
 async function main(): Promise<void> {
   transport = await loadTransport(config.transportBaseUrl);
-  transport.setShinyPrefix(transport.resolveShinyPrefix(import.meta.url));
+  transport.setShinyPrefix(shinyPrefix());
 
   installHostServiceWorkerListeners();
   installGlobalHelpers();

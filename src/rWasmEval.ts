@@ -1,11 +1,10 @@
 /**
  * Inject evalR into the Emscripten R glue (must run inside the glue IIFE so
- * resolveGlobalSymbol / stackAlloc are in scope). Uses libR.so symbols after
- * side modules are preloaded — not httpuv.
+ * resolveGlobalSymbol / stackAlloc are in scope). Resolves R API symbols from
+ * the main R.wasm module after initR — not from JS-preloaded side modules.
  */
 export function injectRWasmEvalGlue(glue: string): string {
-  const patch = `Module["loadDynamicLibraryAsync"]=(name)=>loadDynamicLibrary(name,{loadAsync:true,global:true,nodelete:true,allowUndefined:true});
-function shinyForgeResolveR(symName){
+  const patch = `function shinyForgeResolveR(symName){
   var resolved=resolveGlobalSymbol(symName).sym;
   if(!resolved){throw new Error("R symbol not available: "+symName)}
   return resolved;
@@ -24,17 +23,33 @@ function shinyForgeGlobalEnv(){
   }
   return env;
 }
-function shinyForgeCallMain(args=[]){
-  var entryFunction=resolveGlobalSymbol("main").sym;
-  if(!entryFunction)return;
+function shinyForgeArgv(args){
   args.unshift(thisProgram);
   var argc=args.length;
   var argv=stackAlloc((argc+1)*4);
   var argv_ptr=argv;
   args.forEach(function(arg){HEAPU32[argv_ptr>>2]=stringToUTF8OnStack(arg);argv_ptr+=4});
   HEAPU32[argv_ptr>>2]=0;
-  try{return entryFunction(argc,argv)}catch(e){return handleException(e)}
+  return {argc:argc,argv:argv};
 }
+var shinyForgeRInitialized=false;
+function shinyForgeInitR(args=[]){
+  if(shinyForgeRInitialized){return 0}
+  var initR=shinyForgeResolveR("Rf_initialize_R");
+  var av=shinyForgeArgv(args);
+  var status;
+  try{status=initR(av.argc,av.argv)}catch(e){return handleException(e)}
+  shinyForgeResolveR("setup_Rmainloop")();
+  shinyForgeRInitialized=true;
+  return status;
+}
+function shinyForgeCallMain(args=[]){
+  var entryFunction=resolveGlobalSymbol("main").sym;
+  if(!entryFunction)return;
+  var av=shinyForgeArgv(args);
+  try{return entryFunction(av.argc,av.argv)}catch(e){return handleException(e)}
+}
+Module.initR=shinyForgeInitR;
 Module.evalR=function(code){
   var Rf_allocVector=shinyForgeResolveR("Rf_allocVector");
   var SET_STRING_ELT=shinyForgeResolveR("SET_STRING_ELT");

@@ -14,8 +14,8 @@ export interface EmscriptenFS {
 export interface RModule {
   FS: EmscriptenFS;
   evalR: (code: string) => unknown;
+  initR: (args: string[]) => number;
   callMain: (args: string[]) => number;
-  loadDynamicLibraryAsync: (path: string) => Promise<void>;
   _rWasmEvalDepth: number;
   [key: string]: unknown;
 }
@@ -142,6 +142,22 @@ export function writeCachedTree(module: RModule, fileCache: Map<string, Uint8Arr
   }
 }
 
+/** Mirror R_HOME/lib/*.so to /lib for emscripten dynlink runtimePaths (see Rtester.js). */
+export function mountRHomeLibToSlashLib(
+  module: RModule,
+  fileCache: Map<string, Uint8Array>,
+): void {
+  const libPrefix = `${WASM_R_HOME}/lib/`;
+  for (const [path, data] of fileCache) {
+    if (!path.startsWith(libPrefix) || !path.endsWith(".so")) {
+      continue;
+    }
+    const base = path.slice(libPrefix.length);
+    module.FS.mkdirTree("/lib");
+    module.FS.writeFile(`/lib/${base}`, data);
+  }
+}
+
 export function verifyMountedTree(module: RModule): void {
   const methodsSo = `${WASM_R_HOME}/library/methods/libs/methods.so`;
   const info = module.FS.analyzePath(methodsSo);
@@ -178,22 +194,6 @@ async function loadGlue(baseUrl: string): Promise<string> {
   return glue;
 }
 
-export async function preloadWasmSideModules(
-  module: RModule,
-  fileCache: Map<string, Uint8Array>,
-): Promise<void> {
-  const libR = `${WASM_R_HOME}/lib/libR.so`;
-  const paths = [...fileCache.keys()].filter((p) => p.endsWith(".so"));
-  const ordered = [
-    ...paths.filter((p) => p === libR),
-    ...paths.filter((p) => p !== libR).sort(),
-  ];
-  console.info("[rWasm] Preloading", ordered.length, "WASM side modules");
-  for (const path of ordered) {
-    await module.loadDynamicLibraryAsync(path);
-  }
-}
-
 export function evalR(Module: RModule, code: string): unknown {
   if (typeof Module.evalR !== "function") {
     throw new Error("Module.evalR is missing; check rWasmEval.ts glue patch");
@@ -210,11 +210,58 @@ export function evalR(Module: RModule, code: string): unknown {
   }
 }
 
-export async function bootstrapRSession(Module: RModule): Promise<void> {
-  const status = Module.callMain(["--no-restore", "--no-save", "-e", "2+4"]);
-  if (status !== 0) {
-    throw new Error(`R bootstrap failed with status ${status}`);
+/** Temporary diagnostic — remove after graphics bootstrap is fixed. */
+function probeGraphicsStack(Module: RModule): void {
+  try {
+    evalR(
+      Module,
+      `tryCatch({
+  cat("[rWasm:graphics] graphics loaded:", "graphics" %in% loadedNamespaces(), "\\n")
+  cat("[rWasm:graphics] grDevices loaded:", "grDevices" %in% loadedNamespaces(), "\\n")
+  cat("[rWasm:graphics] capabilities(cairo):", capabilities("cairo"), "\\n")
+  if ("graphics" %in% loadedNamespaces()) {
+    dlls <- getNamespaceInfo(asNamespace("graphics"), "DLLs")
+    if (length(dlls)) {
+      cat("[rWasm:graphics] graphics DLL path:", dlls[[1]][["path"]], "\\n")
+    }
   }
+  tryCatch({
+    f <- tempfile(fileext = ".png")
+    grDevices::png(f, width = 100, height = 100)
+    cat("[rWasm:graphics] png() dev.cur():", grDevices::dev.cur(), "\\n")
+    graphics::plot.new()
+    cat("[rWasm:graphics] plot.new() ok\\n")
+    grDevices::dev.off()
+  }, error = function(e) {
+    cat("[rWasm:graphics] png/plot.new error:", conditionMessage(e), "\\n")
+  })
+  tryCatch({
+    grDevices::pdf(file = NULL)
+    cat("[rWasm:graphics] pdf(NULL) dev.cur():", grDevices::dev.cur(), "\\n")
+    graphics::plot.new()
+    cat("[rWasm:graphics] pdf(NULL) plot.new() ok\\n")
+    grDevices::dev.off()
+  }, error = function(e) {
+    cat("[rWasm:graphics] pdf/plot.new error:", conditionMessage(e), "\\n")
+  })
+}, error = function(e) {
+  cat("[rWasm:graphics] probe error:", conditionMessage(e), "\\n")
+})`,
+    );
+  } catch (err) {
+    console.warn("[rWasm:graphics] probe failed:", err);
+  }
+}
+
+export async function bootstrapRSession(Module: RModule): Promise<void> {
+  const status = Module.initR(["--no-restore", "--no-save", "--vanilla"]);
+  if (status !== 0) {
+    throw new Error(`R init failed with status ${status}`);
+  }
+
+  evalR(Module, "2+4");
+
+  probeGraphicsStack(Module);
 
   evalR(Module, "suppressPackageStartupMessages(library(httpuv))");
   evalR(Module, 'setwd("/")');
@@ -225,6 +272,30 @@ export function writeWebAppToVfs(Module: RModule, source: string): void {
   Module.FS.mkdirTree(WEB_APP_DIR);
   Module.FS.writeFile(WEB_APP_R, source);
   console.info("[rWasm] Wrote", WEB_APP_R, `(${source.length} bytes)`);
+}
+
+/** A single Shiny app file, path relative to the app directory. */
+export interface WebAppFile {
+  path: string;
+  data: Uint8Array;
+}
+
+/** Write every app file (text + binary, with subdirectories) into /webApp. */
+export function writeWebAppFilesToVfs(Module: RModule, files: WebAppFile[]): void {
+  Module.FS.mkdirTree(WEB_APP_DIR);
+  for (const file of files) {
+    const rel = file.path.replace(/^\/+/, "");
+    if (!rel || rel.includes("..")) {
+      continue;
+    }
+    const dst = `${WEB_APP_DIR}/${rel}`;
+    const parent = dst.substring(0, dst.lastIndexOf("/"));
+    if (parent) {
+      Module.FS.mkdirTree(parent);
+    }
+    Module.FS.writeFile(dst, file.data);
+  }
+  console.info("[rWasm] Wrote", files.length, "webApp file(s) into", WEB_APP_DIR);
 }
 
 /**
@@ -263,16 +334,14 @@ export async function initRModule({
       onRuntimeInitialized() {
         const module = globalThis.Module as RModule;
         writeCachedTree(module, fileCache);
+        mountRHomeLibToSlashLib(module, fileCache);
         try {
           verifyMountedTree(module);
         } catch (err) {
           reject(err);
           return;
         }
-        preloadWasmSideModules(module, fileCache)
-          .then(() => bootstrapRSession(module))
-          .then(() => resolve(module))
-          .catch(reject);
+        bootstrapRSession(module).then(() => resolve(module)).catch(reject);
       },
       onAbort(reason: unknown) {
         reject(new Error(`R.wasm aborted: ${String(reason)}`));

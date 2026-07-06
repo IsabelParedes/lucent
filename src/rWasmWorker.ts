@@ -5,8 +5,10 @@ import {
   evalR,
   initRModule,
   setEvalRPostFlush,
+  writeWebAppFilesToVfs,
   writeWebAppToVfs,
   type RModule,
+  type WebAppFile,
 } from "./rWasmBootstrap";
 import { RWASM } from "./rwasm-constants";
 import { loadTransport, type ChannelMessageLike, type HttpuvTransport, type OutboundMessage } from "./transport";
@@ -325,8 +327,9 @@ function pushToR(msg: ChannelMessageLike): void {
   evalRNow(`tryCatch({
   ${t.channelMessageToRExpr(msg)}
 }, error=function(e) {
-  message("[httpuv] push failed: ", conditionMessage(e))
-  stop(conditionMessage(e))
+  msg <- paste0("[httpuv] push failed (", ${JSON.stringify(String(msg.url ?? ""))}, "): ", conditionMessage(e))
+  message(msg)
+  stop(msg)
 })`);
   if (msg?.uuid) {
     dbg("worker-push-evalR-finish", { uuid: msg.uuid });
@@ -463,6 +466,7 @@ async function drainHttpDeliveryQueue(): Promise<void> {
       await deliverOneHttpRequest(item.req);
       item.resolve();
     } catch (err) {
+      logHttpDeliveryError(err, itemUrl);
       item.reject(err);
     } finally {
       if (needsSuspend) {
@@ -586,8 +590,9 @@ function ensureRLaterPump(): void {
   dbg("later-pump", { intervalMs: PUMP_INTERVAL_MS, driver: "message-loop" });
 }
 
-function logHttpDeliveryError(err: unknown): void {
-  console.error("[rWasmWorker] deliverHttpRequest failed:", formatRWasmError(err), err);
+function logHttpDeliveryError(err: unknown, url?: string): void {
+  const where = url ? ` ${url}` : "";
+  console.error(`[rWasmWorker] deliverHttpRequest failed:${where}`, formatRWasmError(err), err);
 }
 
 /**
@@ -612,7 +617,13 @@ function enqueueHttpDelivery(req: HostInboundMessage): Promise<void> {
 }
 
 function installBridge(t: HttpuvTransport): void {
-  t.setShinyPrefix(t.resolveShinyPrefix(import.meta.url));
+  // Must match the host's mount prefix (config.shinyBaseUrl → `/shiny/`), NOT
+  // import.meta.url: the worker bundle lives in /lucent/dist/, and this prefix
+  // is baked into the app document's <base href>, which drives every relative
+  // Shiny asset URL. Deriving it from the bundle path sends assets to
+  // /lucent/dist/shiny/... where no files exist.
+  const shinyBase = new URL(config.shinyBaseUrl, self.location.href).href;
+  t.setShinyPrefix(t.resolveShinyPrefix(shinyBase));
   setEvalRPostFlush(() => t.flushDeferredOutbound());
   t.installHttpuvBridge({
     installSwListener: false,
@@ -644,6 +655,24 @@ function ensureRModule(): Promise<RModule> {
     rModulePromise = initEverything();
   }
   return rModulePromise;
+}
+
+function readVfsFile(vfsDir: string, suffix: string): Promise<ArrayBuffer | null> {
+  return ensureRModule().then(() => {
+    const module = requireRModule();
+    const rel = suffix.replace(/^\/+/, "");
+    if (!rel || rel.includes("..")) {
+      return null;
+    }
+    const path = `${vfsDir.replace(/\/$/, "")}/${rel}`;
+    try {
+      const data = module.FS.readFile(path, { encoding: "binary" });
+      return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+    } catch (err) {
+      log("error", `[rWasmWorker] readVfsFile failed ${path}: ${formatRWasmError(err)}`);
+      return null;
+    }
+  });
 }
 
 function readShinyResourcePathsFromR(): Record<string, string> {
@@ -698,6 +727,7 @@ function exposeRHost(port: MessagePort): void {
         });
     },
     getResourcePaths: () => getShinyResourcePaths(),
+    readVfsFile: (vfsDir, suffix) => readVfsFile(vfsDir, suffix),
     registerSwDelivery: (deliveryPort) => {
       connectSwDelivery(deliveryPort);
     },
@@ -763,6 +793,23 @@ async function onMessage(event: MessageEvent): Promise<void> {
       try {
         const module = await ensureRModule();
         writeWebAppToVfs(module, String(data.source ?? ""));
+        postToHost({ type: RWASM.EVAL_RESULT, id: data.id, ok: true });
+      } catch (err) {
+        postToHost({
+          type: RWASM.EVAL_RESULT,
+          id: data.id,
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      break;
+    }
+
+    case RWASM.WRITE_WEB_APP_FILES: {
+      try {
+        const module = await ensureRModule();
+        const files = Array.isArray(data.files) ? (data.files as WebAppFile[]) : [];
+        writeWebAppFilesToVfs(module, files);
         postToHost({ type: RWASM.EVAL_RESULT, id: data.id, ok: true });
       } catch (err) {
         postToHost({

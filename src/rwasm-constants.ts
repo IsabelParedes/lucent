@@ -5,6 +5,7 @@ export const RWASM = {
   EVAL: "rwasm_eval",
   EVAL_RESULT: "rwasm_eval_result",
   WRITE_WEB_APP: "rwasm_write_web_app",
+  WRITE_WEB_APP_FILES: "rwasm_write_web_app_files",
   STOP_APP: "rwasm_stop_app",
   STOPPED: "rwasm_stopped",
   COMLINK_PORT: "rwasm_comlink_port",
