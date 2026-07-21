@@ -123,23 +123,30 @@ async function waitForServiceWorkerController(
   });
 }
 
-async function waitForWorkerActivated(
+async function waitForServiceWorkerInstall(
   reg: ServiceWorkerRegistration,
   timeoutMs = 15_000,
 ): Promise<void> {
-  await navigator.serviceWorker.ready;
-
-  const worker = reg.installing ?? reg.waiting ?? reg.active;
+  const worker = reg.waiting ?? reg.installing ?? reg.active;
   if (!worker) {
+    await navigator.serviceWorker.ready;
     return;
   }
-  if (worker.state === "activated") {
+
+  if (
+    worker.state === "activated" ||
+    worker.state === "installed"
+  ) {
     return;
   }
 
   await new Promise<void>((resolve, reject) => {
     const onStateChange = () => {
-      if (worker.state === "activated") {
+      if (
+        worker.state === "activated" ||
+        worker.state === "installed" ||
+        worker.state === "redundant"
+      ) {
         cleanup();
         resolve();
       }
@@ -147,6 +154,10 @@ async function waitForWorkerActivated(
 
     const deadline = setTimeout(() => {
       cleanup();
+      if (worker.state === "installed") {
+        resolve();
+        return;
+      }
       reject(new Error(`Service worker activation timed out (state: ${worker.state})`));
     }, timeoutMs);
 
@@ -156,12 +167,36 @@ async function waitForWorkerActivated(
     };
 
     worker.addEventListener("statechange", onStateChange);
-
-    if (worker.state === "activated") {
-      cleanup();
-      resolve();
-    }
+    onStateChange();
   });
+}
+
+function serviceWorkerScriptPath(): string {
+  return serviceWorkerScriptUrl().href.split("?")[0];
+}
+
+function controllerMatchesExpectedScript(): boolean {
+  const expected = serviceWorkerScriptPath();
+  const current = navigator.serviceWorker.controller?.scriptURL.split("?")[0];
+  return current === expected;
+}
+
+/** Drop httpuv-sw registrations from an older script URL (e.g. pre-_env-wasm). */
+async function cleanupStaleHttpuvServiceWorkers(): Promise<void> {
+  const expected = serviceWorkerScriptPath();
+  for (const reg of await navigator.serviceWorker.getRegistrations()) {
+    const scriptUrls = [reg.active, reg.waiting, reg.installing]
+      .filter((worker): worker is ServiceWorker => worker != null)
+      .map((worker) => worker.scriptURL.split("?")[0]);
+    const isHttpuv = scriptUrls.some((url) => url.endsWith("/httpuv-sw.js"));
+    if (!isHttpuv) {
+      continue;
+    }
+    if (!scriptUrls.includes(expected)) {
+      console.info("[httpuv] Unregistering stale service worker", scriptUrls);
+      await reg.unregister();
+    }
+  }
 }
 
 async function registerHttpuvServiceWorker(): Promise<ServiceWorkerRegistration | null> {
@@ -171,14 +206,20 @@ async function registerHttpuvServiceWorker(): Promise<ServiceWorkerRegistration 
   }
 
   try {
+    await cleanupStaleHttpuvServiceWorkers();
+
     const reg = await navigator.serviceWorker.register(serviceWorkerScriptUrl(), {
-      type: "module",
       scope: "/",
       updateViaCache: "none",
     });
-    await waitForWorkerActivated(reg);
+    await waitForServiceWorkerInstall(reg);
 
-    if (!navigator.serviceWorker.controller) {
+    if (reg.waiting) {
+      reg.waiting.postMessage({ type: "SKIP_WAITING" });
+      await waitForServiceWorkerInstall(reg, 5_000).catch(() => undefined);
+    }
+
+    if (!navigator.serviceWorker.controller || !controllerMatchesExpectedScript()) {
       const reloaded = sessionStorage.getItem(HTTPUV_SW_RELOAD_KEY);
       if (!reloaded) {
         sessionStorage.setItem(HTTPUV_SW_RELOAD_KEY, "1");
@@ -187,7 +228,7 @@ async function registerHttpuvServiceWorker(): Promise<ServiceWorkerRegistration 
         await new Promise(() => {});
       }
       console.warn(
-        "[httpuv] Page still not controlled after reload; check Application → Service Workers for httpuv-sw.js errors",
+        "[httpuv] Page still not controlled by the expected worker; check Application → Service Workers for httpuv-sw.js errors",
       );
     } else {
       sessionStorage.removeItem(HTTPUV_SW_RELOAD_KEY);
@@ -336,7 +377,7 @@ async function ensureComlinkConnected(): Promise<void> {
   comlinkPromise = (async () => {
     console.info("[runApp] Waiting for R worker and service worker…");
     const [worker] = await Promise.all([ensureRWorker(), ensureHttpuvServiceWorker()]);
-    if (!navigator.serviceWorker.controller) {
+    if (!navigator.serviceWorker.controller || !controllerMatchesExpectedScript()) {
       throw new Error("Service worker controller is not available");
     }
     console.info("[runApp] Connecting Comlink…");
