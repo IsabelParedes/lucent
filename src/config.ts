@@ -1,7 +1,9 @@
+import { HOST_PREFIX, WASM_R_HOME } from "./rWasmBootstrap";
+
 export interface LucentConfig {
   /** Base URL where the r-httpuv transport assets (httpuv-web.js, httpuv-sw.js, ...) are served. */
   transportBaseUrl: string;
-  /** Base URL where the R.wasm runtime (R, R.wasm, R_HOME/, R_HOME-manifest.json) is served. */
+  /** Base URL of the site root (_env-wasm-manifest.json and host prefix tree). */
   rRuntimeBaseUrl: string;
   /**
    * Base URL under which the virtual Shiny app is mounted; the mount prefix is
@@ -16,10 +18,10 @@ export interface LucentConfig {
   appManifestUrl?: string;
 }
 
-/** Default location of the transport assets once r-httpuv is installed into R_HOME. */
-export const DEFAULT_TRANSPORT_BASE_URL = "/R_HOME/library/httpuv/www/";
+/** Default location of r-httpuv transport assets inside the wasm prefix. */
+export const DEFAULT_TRANSPORT_BASE_URL = `/${HOST_PREFIX}${WASM_R_HOME}/library/httpuv/www/`;
 
-/** Default location of the R.wasm runtime assets (currently the site root). */
+/** Default site root for the wasm prefix manifest and host tree. */
 export const DEFAULT_R_RUNTIME_BASE_URL = "/";
 
 /** Default base for the Shiny mount point (origin root → prefix `/shiny/`). */
