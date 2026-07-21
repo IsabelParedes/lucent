@@ -21,7 +21,7 @@ export interface RModule {
 }
 
 export interface InitRModuleOptions {
-  /** Absolute base URL where R, R.wasm, R_HOME/ and the manifest are served. */
+  /** Base URL of the site root (manifest, host prefix tree). */
   assetBaseUrl: string;
   httpuv?: unknown;
   print?: (text: string) => void;
@@ -34,67 +34,68 @@ export function setEvalRPostFlush(fn: () => void): void {
   evalRPostFlush = fn;
 }
 
-export const WASM_R_HOME = "/R_HOME";
+/** Host directory name under assetBaseUrl where the wasm prefix is served. */
+export const HOST_PREFIX = "_env-wasm";
+
+/** R_HOME inside the mounted prefix (VFS root is /). */
+export const WASM_R_HOME = "/lib/R";
+
 export const WEB_APP_DIR = "/webApp";
 export const WEB_APP_R = `${WEB_APP_DIR}/app.R`;
 
 const VFS_SKIP = new Set([`${WASM_R_HOME}/etc/ldpaths`, `${WASM_R_HOME}/etc/Makeconf`]);
 
 export function rEnv(): Record<string, string> {
-  const wasmRHome = WASM_R_HOME;
   return {
-    R_HOME: wasmRHome,
-    R_LIBS: `${wasmRHome}/library`,
+    R_HOME: WASM_R_HOME,
+    R_LIBS: `${WASM_R_HOME}/library`,
     R_LIBS_USER: "NULL",
     R_LIBS_SITE: "NULL",
-    LD_LIBRARY_PATH: `${wasmRHome}/lib:/lib`,
+    LD_LIBRARY_PATH: `${WASM_R_HOME}/lib:/lib`,
   };
 }
 
 interface AssetUrls {
   glue: URL;
   wasm: URL;
-  rHome: URL;
-  rLib: URL;
   manifest: URL;
+}
+
+function hostPrefixBase(baseUrl: string): URL {
+  return new URL(`${HOST_PREFIX}/`, new URL(baseUrl, self.location.href));
 }
 
 export function createAssetUrls(baseUrl: string): AssetUrls {
   const base = new URL(baseUrl, self.location.href);
+  const hostPrefix = hostPrefixBase(baseUrl);
   return {
-    glue: new URL("R", base),
-    wasm: new URL("R.wasm", base),
-    rHome: new URL("R_HOME/", base),
-    rLib: new URL("R_HOME/lib/", base),
-    manifest: new URL("R_HOME-manifest.json", base),
+    glue: new URL("lib/R/bin/exec/R", hostPrefix),
+    wasm: new URL("lib/R/bin/exec/R.wasm", hostPrefix),
+    manifest: new URL("_env-wasm-manifest.json", base),
   };
 }
 
 export function createLocateFile(baseUrl: string): (file: string) => string {
-  const base = new URL(baseUrl, self.location.href);
+  const hostPrefix = hostPrefixBase(baseUrl);
   return function locateFile(file: string): string {
     const fileBase = file.split("/").pop() ?? file;
     if (fileBase.endsWith(".wasm")) {
-      return new URL("R.wasm", base).href;
+      return new URL("lib/R/bin/exec/R.wasm", hostPrefix).href;
     }
     const pkgMatch = file.match(/\/library\/([^/]+)\/libs\/([^/]+)$/);
     if (pkgMatch) {
-      return new URL(`R_HOME/library/${pkgMatch[1]}/libs/${pkgMatch[2]}`, base).href;
+      return new URL(`lib/R/library/${pkgMatch[1]}/libs/${pkgMatch[2]}`, hostPrefix).href;
     }
-    return new URL(`R_HOME/lib/${fileBase}`, base).href;
+    return new URL(`lib/R/lib/${fileBase}`, hostPrefix).href;
   };
 }
 
-function dstToFetchUrl(baseUrl: string, dst: string): string {
-  const { rHome, rLib } = createAssetUrls(baseUrl);
-  const prefix = `${WASM_R_HOME}/`;
-  if (dst.startsWith(prefix)) {
-    return new URL(dst.slice(prefix.length), rHome).href;
+/** Map an absolute VFS path to the HTTP URL under the host prefix tree. */
+export function vfsPathToFetchUrl(baseUrl: string, vfsPath: string): string {
+  if (!vfsPath.startsWith("/")) {
+    throw new Error(`Expected absolute VFS path: ${vfsPath}`);
   }
-  if (dst.startsWith("/lib/")) {
-    return new URL(dst.slice(5), rLib).href;
-  }
-  throw new Error(`Unknown mount path: ${dst}`);
+  return new URL(`${HOST_PREFIX}${vfsPath}`, new URL(baseUrl, self.location.href)).href;
 }
 
 export async function mountRHome(baseUrl: string): Promise<Map<string, Uint8Array>> {
@@ -116,7 +117,7 @@ export async function mountRHome(baseUrl: string): Promise<Map<string, Uint8Arra
         if (VFS_SKIP.has(dst)) {
           continue;
         }
-        const fetchUrl = dstToFetchUrl(baseUrl, dst);
+        const fetchUrl = vfsPathToFetchUrl(baseUrl, dst);
         const fileRes = await fetch(fetchUrl, { cache: "no-store" });
         if (!fileRes.ok) {
           throw new Error(`Failed to fetch ${fetchUrl}: HTTP ${fileRes.status}`);
@@ -216,7 +217,7 @@ export async function remountRHome(Module: RModule, assetBaseUrl: string): Promi
   mountRHomeLibToSlashLib(Module, fileCache);
   verifyMountedTree(Module);
   // VFS remount does not reload namespaces already resident in memory.
-  // Unload transport/plot packages so the next library() picks up new R_HOME files.
+  // Unload transport/plot packages so the next library() picks up new prefix files.
   evalR(Module, `tryCatch({
   for (pkg in c("shiny", "httpuv")) {
     if (pkg %in% loadedNamespaces()) {
@@ -242,7 +243,7 @@ export async function remountRHome(Module: RModule, assetBaseUrl: string): Promi
 }, error = function(e) {
   cat("[rWasm] shiny reload check failed:", conditionMessage(e), "\\n")
 })`);
-  console.info("[rWasm] Remounted R_HOME from", assetBaseUrl);
+  console.info("[rWasm] Remounted prefix from", assetBaseUrl);
 }
 
 export async function bootstrapRSession(Module: RModule): Promise<void> {
