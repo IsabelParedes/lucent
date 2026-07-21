@@ -68,13 +68,18 @@ function serviceWorkerScriptUrl(): URL {
   // Tell the SW its mount prefix up-front so it intercepts correctly before the
   // REGISTER_HOST message arrives (avoids a first-load race on asset requests).
   url.searchParams.set("shinyPrefix", shinyPrefix());
+  url.searchParams.set("hostPrefix", config.hostPrefixDir);
   return url;
 }
 
 function announceHostToServiceWorker(): boolean {
   const t = requireTransport();
   const prefix = shinyPrefix();
-  const msg = { type: t.MSG.REGISTER_HOST, shinyPrefix: prefix };
+  const msg = {
+    type: t.MSG.REGISTER_HOST,
+    shinyPrefix: prefix,
+    hostPrefix: config.hostPrefixDir,
+  };
   const controller = navigator.serviceWorker.controller;
   if (controller) {
     controller.postMessage(msg);
@@ -263,6 +268,7 @@ function workerConfigParam(): string {
   const payload: Partial<LucentConfig> = {
     transportBaseUrl: abs(config.transportBaseUrl),
     rRuntimeBaseUrl: abs(config.rRuntimeBaseUrl),
+    hostPrefixDir: config.hostPrefixDir,
     shinyBaseUrl: abs(config.shinyBaseUrl),
     appDirUrl: abs(config.appDirUrl),
     appManifestUrl: abs(config.appManifestUrl),

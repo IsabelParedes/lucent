@@ -5,6 +5,8 @@ export interface LucentConfig {
   transportBaseUrl: string;
   /** Base URL of the site root (_env-wasm-manifest.json and host prefix tree). */
   rRuntimeBaseUrl: string;
+  /** Host directory name under rRuntimeBaseUrl where the wasm prefix tree is served. */
+  hostPrefixDir: string;
   /**
    * Base URL under which the virtual Shiny app is mounted; the mount prefix is
    * `<shinyBaseUrl>shiny/`. Defaults to the origin root ("/"), giving `/shiny/`.
@@ -17,6 +19,9 @@ export interface LucentConfig {
   /** URL of the app file manifest ({ files: string[] }). Defaults to `manifest.json` under appDirUrl. */
   appManifestUrl?: string;
 }
+
+/** Default host directory for the wasm prefix tree under the site root. */
+export const DEFAULT_HOST_PREFIX_DIR = HOST_PREFIX;
 
 /** Default location of r-httpuv transport assets inside the wasm prefix. */
 export const DEFAULT_TRANSPORT_BASE_URL = `/${HOST_PREFIX}${WASM_R_HOME}/library/httpuv/www/`;
@@ -73,6 +78,7 @@ export function resolveLucentConfig(overrides: Partial<LucentConfig> = {}): Luce
   return {
     transportBaseUrl: pick("transportBaseUrl") ?? DEFAULT_TRANSPORT_BASE_URL,
     rRuntimeBaseUrl: pick("rRuntimeBaseUrl") ?? DEFAULT_R_RUNTIME_BASE_URL,
+    hostPrefixDir: pick("hostPrefixDir") ?? DEFAULT_HOST_PREFIX_DIR,
     shinyBaseUrl: pick("shinyBaseUrl") ?? DEFAULT_SHINY_BASE_URL,
     appDirUrl: pick("appDirUrl"),
     appManifestUrl: pick("appManifestUrl"),
