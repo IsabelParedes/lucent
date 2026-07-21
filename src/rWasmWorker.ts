@@ -4,6 +4,7 @@ import { resolveLucentConfig } from "./config";
 import {
   evalR,
   initRModule,
+  remountRHome,
   setEvalRPostFlush,
   writeWebAppFilesToVfs,
   writeWebAppToVfs,
@@ -86,7 +87,7 @@ const WASM_SINGLE_SERVICE_TICK = `tryCatch({
 const WASM_HTTP_DRAIN_TICK = WASM_SINGLE_SERVICE_TICK;
 
 /** Service rounds after push idle wait (promise resolution only). */
-const HTTP_PUSH_DRAIN_ROUNDS = 64;
+const HTTP_PUSH_DRAIN_ROUNDS = 128;
 
 /** Poll interval while waiting for emscripten later timers (no evalR). */
 const HTTP_IDLE_POLL_MS = 16;
@@ -123,6 +124,7 @@ let pumpTimer: ReturnType<typeof setTimeout> | null = null;
 let lastActivityTs = 0;
 let lastPumpTickTs = 0;
 
+let rAssetBaseUrl: string | null = null;
 let transport: HttpuvTransport | null = null;
 let rModule: RModule | null = null;
 let rModulePromise: Promise<RModule> | null = null;
@@ -639,6 +641,7 @@ async function initEverything(): Promise<RModule> {
   HTTP_IDLE_MAX_MS = transport.REQUEST_TIMEOUT_MS;
   installBridge(transport);
   const assetBaseUrl = new URL(config.rRuntimeBaseUrl, self.location.href).href;
+  rAssetBaseUrl = assetBaseUrl;
   const module = await initRModule({
     assetBaseUrl,
     httpuv: (globalThis.Module as { httpuv?: unknown } | undefined)?.httpuv,
@@ -842,6 +845,29 @@ async function onMessage(event: MessageEvent): Promise<void> {
           });
         } else {
           log("error", `[rWasmWorker] eval failed: ${message}`);
+        }
+      }
+      break;
+    }
+
+    case RWASM.REMOUNT_R_HOME: {
+      try {
+        if (!rAssetBaseUrl) {
+          throw new Error("R asset base URL is not set");
+        }
+        await remountRHome(requireRModule(), rAssetBaseUrl);
+        if (data.id != null) {
+          postToHost({ type: RWASM.EVAL_RESULT, id: data.id, ok: true });
+        }
+      } catch (err) {
+        log("error", `[rWasmWorker] remount R_HOME failed: ${formatRWasmError(err)}`);
+        if (data.id != null) {
+          postToHost({
+            type: RWASM.EVAL_RESULT,
+            id: data.id,
+            ok: false,
+            error: formatRWasmError(err),
+          });
         }
       }
       break;

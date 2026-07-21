@@ -7,6 +7,7 @@ export const RWASM = {
   WRITE_WEB_APP: "rwasm_write_web_app",
   WRITE_WEB_APP_FILES: "rwasm_write_web_app_files",
   STOP_APP: "rwasm_stop_app",
+  REMOUNT_R_HOME: "rwasm_remount_r_home",
   STOPPED: "rwasm_stopped",
   COMLINK_PORT: "rwasm_comlink_port",
   COMLINK_READY: "rwasm_comlink_ready",

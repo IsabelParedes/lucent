@@ -15,6 +15,12 @@ function shinyForgeRData(symName){
   if(sym&&typeof sym==="object"&&"value"in sym){return sym.value}
   return getValue(sym,"i32");
 }
+function shinyForgeSetRData(symName,value){
+  var sym=shinyForgeResolveR(symName);
+  if(typeof sym==="function"){sym=sym()}
+  if(sym&&typeof sym==="object"&&"value"in sym){sym.value=value;return}
+  setValue(sym,value,"i32");
+}
 function shinyForgeGlobalEnv(){
   var env=shinyForgeRData("R_GlobalEnv");
   var TYPEOF=shinyForgeResolveR("TYPEOF");
@@ -40,6 +46,7 @@ function shinyForgeInitR(args=[]){
   var status;
   try{status=initR(av.argc,av.argv)}catch(e){return handleException(e)}
   shinyForgeResolveR("setup_Rmainloop")();
+  shinyForgeSetRData("R_running_as_main_program",1);
   shinyForgeRInitialized=true;
   return status;
 }

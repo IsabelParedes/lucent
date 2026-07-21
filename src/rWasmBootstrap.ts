@@ -101,7 +101,7 @@ export async function mountRHome(baseUrl: string): Promise<Map<string, Uint8Arra
   const fileCache = new Map<string, Uint8Array>();
   const { manifest } = createAssetUrls(baseUrl);
 
-  const res = await fetch(manifest);
+  const res = await fetch(manifest, { cache: "no-store" });
   if (!res.ok) {
     throw new Error(`Failed to fetch ${manifest.href}: HTTP ${res.status}`);
   }
@@ -117,7 +117,7 @@ export async function mountRHome(baseUrl: string): Promise<Map<string, Uint8Arra
           continue;
         }
         const fetchUrl = dstToFetchUrl(baseUrl, dst);
-        const fileRes = await fetch(fetchUrl);
+        const fileRes = await fetch(fetchUrl, { cache: "no-store" });
         if (!fileRes.ok) {
           throw new Error(`Failed to fetch ${fetchUrl}: HTTP ${fileRes.status}`);
         }
@@ -210,47 +210,39 @@ export function evalR(Module: RModule, code: string): unknown {
   }
 }
 
-/** Temporary diagnostic — remove after graphics bootstrap is fixed. */
-function probeGraphicsStack(Module: RModule): void {
-  try {
-    evalR(
-      Module,
-      `tryCatch({
-  cat("[rWasm:graphics] graphics loaded:", "graphics" %in% loadedNamespaces(), "\\n")
-  cat("[rWasm:graphics] grDevices loaded:", "grDevices" %in% loadedNamespaces(), "\\n")
-  cat("[rWasm:graphics] capabilities(cairo):", capabilities("cairo"), "\\n")
-  if ("graphics" %in% loadedNamespaces()) {
-    dlls <- getNamespaceInfo(asNamespace("graphics"), "DLLs")
-    if (length(dlls)) {
-      cat("[rWasm:graphics] graphics DLL path:", dlls[[1]][["path"]], "\\n")
+export async function remountRHome(Module: RModule, assetBaseUrl: string): Promise<void> {
+  const fileCache = await mountRHome(assetBaseUrl);
+  writeCachedTree(Module, fileCache);
+  mountRHomeLibToSlashLib(Module, fileCache);
+  verifyMountedTree(Module);
+  // VFS remount does not reload namespaces already resident in memory.
+  // Unload transport/plot packages so the next library() picks up new R_HOME files.
+  evalR(Module, `tryCatch({
+  for (pkg in c("shiny", "httpuv")) {
+    if (pkg %in% loadedNamespaces()) {
+      tryCatch(unloadNamespace(pkg), error = function(e) {
+        cat("[rWasm] unloadNamespace ", pkg, ": ", conditionMessage(e), "\\n", sep = "")
+      })
     }
   }
-  tryCatch({
-    f <- tempfile(fileext = ".png")
-    grDevices::png(f, width = 100, height = 100)
-    cat("[rWasm:graphics] png() dev.cur():", grDevices::dev.cur(), "\\n")
-    graphics::plot.new()
-    cat("[rWasm:graphics] plot.new() ok\\n")
-    grDevices::dev.off()
-  }, error = function(e) {
-    cat("[rWasm:graphics] png/plot.new error:", conditionMessage(e), "\\n")
-  })
-  tryCatch({
-    grDevices::pdf(file = NULL)
-    cat("[rWasm:graphics] pdf(NULL) dev.cur():", grDevices::dev.cur(), "\\n")
-    graphics::plot.new()
-    cat("[rWasm:graphics] pdf(NULL) plot.new() ok\\n")
-    grDevices::dev.off()
-  }, error = function(e) {
-    cat("[rWasm:graphics] pdf/plot.new error:", conditionMessage(e), "\\n")
-  })
+}, error = function(e) NULL)`);
+  evalR(Module, `tryCatch({
+  suppressPackageStartupMessages(library(shiny))
+  drawBody <- deparse(body(getFromNamespace("drawPlot", "shiny")))
+  resizeBody <- deparse(body(getFromNamespace("resizeSavedPlot", "shiny")))
+  publishBody <- deparse(body(getFromNamespace("plotPublishPng", "shiny")))
+  fileUrlBody <- deparse(body(ShinySession$public_methods$fileUrl))
+  ok <- all(
+    any(grepl("plotPublishPng", drawBody)),
+    any(grepl("plotImgHasSrc", resizeBody)),
+    any(grepl("wasmPublishFileUrl", publishBody)),
+    any(grepl("wasmPublishFileUrl", fileUrlBody))
+  )
+  cat("[rWasm] shiny wasm plot patch:", ok, "\\n")
 }, error = function(e) {
-  cat("[rWasm:graphics] probe error:", conditionMessage(e), "\\n")
-})`,
-    );
-  } catch (err) {
-    console.warn("[rWasm:graphics] probe failed:", err);
-  }
+  cat("[rWasm] shiny reload check failed:", conditionMessage(e), "\\n")
+})`);
+  console.info("[rWasm] Remounted R_HOME from", assetBaseUrl);
 }
 
 export async function bootstrapRSession(Module: RModule): Promise<void> {
@@ -260,8 +252,6 @@ export async function bootstrapRSession(Module: RModule): Promise<void> {
   }
 
   evalR(Module, "2+4");
-
-  probeGraphicsStack(Module);
 
   evalR(Module, "suppressPackageStartupMessages(library(httpuv))");
   evalR(Module, 'setwd("/")');
