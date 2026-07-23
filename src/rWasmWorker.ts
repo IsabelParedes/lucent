@@ -10,95 +10,20 @@ import {
   type RModule,
   type WebAppFile,
 } from "./rWasmBootstrap";
+import { createHttpDelivery, type HttpDelivery } from "./rWasmHttpDelivery";
+import { createLaterPump } from "./rWasmPump";
+import { createRTaskQueue, SHINY_HOST } from "./rWasmTasks";
 import { RWASM } from "./rwasm-constants";
-import { loadTransport, type ChannelMessageLike, type HttpuvTransport, type OutboundMessage } from "./transport";
-import { createRHostApi, type HostInboundMessage, type SwDeliveryApi } from "./wiring";
+import {
+  loadTransport,
+  type ChannelMessageLike,
+  type HttpuvTransport,
+  type OutboundMessage,
+} from "./transport";
+import { createRHostApi, type SwDeliveryApi } from "./wiring";
 
 const workerSelf = self as unknown as DedicatedWorkerGlobalScope;
 const config = resolveLucentConfig();
-
-// Unthrottled macrotask primitive. A MessageChannel task is not subject to the
-// nested-setTimeout 4ms clamp or the background-tab timer throttling that would
-// otherwise stretch every reactive hop (drain scheduling, HTTP push drain, and
-// the idle service pump) once the tab is hidden. Order is preserved because a
-// MessagePort delivers messages FIFO.
-const macrotaskChannel = new MessageChannel();
-const macrotaskQueue: Array<() => void> = [];
-macrotaskChannel.port1.onmessage = () => {
-  const cb = macrotaskQueue.shift();
-  if (cb) {
-    cb();
-  }
-};
-
-/** Run `cb` on the next macrotask turn without timer clamping/throttling. */
-function scheduleMacrotask(cb: () => void): void {
-  macrotaskQueue.push(cb);
-  macrotaskChannel.port2.postMessage(0);
-}
-
-interface RTask {
-  work: () => void;
-  resolve: () => void;
-  reject: (err: unknown) => void;
-}
-
-const rTaskQueue: RTask[] = [];
-let rDrainScheduled = false;
-let rLocked = false;
-
-const WASM_STOP_EXPR = `tryCatch({
-  if (requireNamespace("shiny", quietly=TRUE) && shiny::isRunning()) {
-    shiny::stopApp()
-  }
-}, error=function(e) NULL)`;
-
-const WASM_SUSPEND_SHINY_LOOP =
-  `tryCatch(shiny::suspendServiceLoop(), error=function(e) NULL)`;
-
-const WASM_RESUME_SHINY_LOOP =
-  `tryCatch(shiny::resumeServiceLoop(), error=function(e) NULL)`;
-
-const WASM_SERVICE_ONCE =
-  `tryCatch(shiny::serviceOnce(), error=function(e) NULL)`;
-
-/** Service rounds after push idle wait (promise resolution only). */
-const HTTP_PUSH_DRAIN_ROUNDS = 128;
-
-/** Poll interval while waiting for emscripten later timers (no evalR). */
-const HTTP_IDLE_POLL_MS = 16;
-
-let httpDeliveryActive = false;
-let httpDeliveryDraining = false;
-let shinyLoopSuspended = false;
-
-interface HttpDeliveryItem {
-  req: HostInboundMessage;
-  resolve: () => void;
-  reject: (err: unknown) => void;
-}
-
-const httpDeliveryQueue: HttpDeliveryItem[] = [];
-
-let activeHttpDrainUuid: string | null = null;
-const httpDrainByUuid = new Map<string, { resolved: boolean }>();
-let httpDeliveryInflight = 0;
-
-/** Minimum spacing between idle service ticks (a real evalR is expensive). */
-const PUMP_INTERVAL_MS = 16;
-
-/** Keep the pump on the unthrottled macrotask loop this long after activity. */
-const ACTIVE_WINDOW_MS = 2_000;
-
-/** Idle-backoff cadence: once quiet, a plain timer is fine (nothing to pump). */
-const IDLE_PUMP_MS = 96;
-
-let pumpStarted = false;
-let pumpScheduled = false;
-let pumpViaMacrotask = false;
-let pumpTimer: ReturnType<typeof setTimeout> | null = null;
-let lastActivityTs = 0;
-let lastPumpTickTs = 0;
 
 let rAssetBaseUrl: string | null = null;
 let transport: HttpuvTransport | null = null;
@@ -108,8 +33,32 @@ let swDelivery: Comlink.Remote<SwDeliveryApi> | null = null;
 let rHostPortReady = false;
 let swDeliveryPortReady = false;
 
-/** Max time to wait for timer-fired handler before evalR drain. */
-let HTTP_IDLE_MAX_MS = 30_000;
+const tasks = createRTaskQueue({
+  getModule: () => rModule,
+  getTransport: () => transport,
+});
+
+const httpRef: { current: HttpDelivery | null } = { current: null };
+
+const pump = createLaterPump({
+  tasks,
+  getModule: () => rModule,
+  isHttpDeliveryActive: () => httpRef.current?.isHttpDeliveryActive() ?? false,
+  hasHttpWork: () => httpRef.current?.hasHttpWork() ?? false,
+  formatError: formatRWasmError,
+  dbg,
+});
+
+const http = createHttpDelivery({
+  tasks,
+  getModule: () => rModule,
+  requireTransport,
+  markActivity: () => pump.markActivity(),
+  dbg,
+  formatError: formatRWasmError,
+  logError: logHttpDeliveryError,
+});
+httpRef.current = http;
 
 function requireTransport(): HttpuvTransport {
   if (!transport) {
@@ -123,10 +72,6 @@ function requireRModule(): RModule {
     throw new Error("[lucent] R module not initialized yet");
   }
   return rModule;
-}
-
-function evalRNow(code: string): void {
-  evalR(requireRModule(), code);
 }
 
 function dbg(stage: string, ...args: unknown[]): void {
@@ -163,56 +108,6 @@ function messageBodyLength(message: unknown): number {
     return message.byteLength;
   }
   return 0;
-}
-
-function deliverToServiceWorker(outbound: OutboundMessage, transfer: Transferable[] = []): void {
-  const t = requireTransport();
-  if (!swDelivery) {
-    console.warn("[rWasmWorker] Service worker delivery API not connected");
-    return;
-  }
-  markActivity();
-
-  if (outbound.type === t.MSG.HTTP_RESPONSE) {
-    dbg("comlink-deliver-http", { uuid: outbound.uuid, status: outbound.status });
-    const drainState = outbound.uuid ? httpDrainByUuid.get(outbound.uuid) : undefined;
-    if (drainState) {
-      drainState.resolved = true;
-    }
-    const resp = {
-      uuid: outbound.uuid,
-      status: outbound.status,
-      headers: outbound.headers,
-      body: outbound.body,
-    };
-    void swDelivery
-      .deliverHttpResponse(transfer.length > 0 ? Comlink.transfer(resp, transfer) : resp)
-      .catch((err: unknown) => {
-        console.error("[rWasmWorker] deliverHttpResponse failed:", formatRWasmError(err), err);
-      });
-    return;
-  }
-
-  if (outbound.type === t.MSG.WS_PUSH) {
-    const handle = t.normalizeSessionHandle(outbound.handle);
-    const msg = {
-      handle,
-      binary: outbound.binary,
-      wsType: outbound.wsType,
-      message: outbound.message,
-    };
-    dbg("comlink-deliver-ws", {
-      handle,
-      wsType: outbound.wsType,
-      binary: outbound.binary,
-      messageLen: messageBodyLength(outbound.message),
-    });
-    void swDelivery
-      .deliverWsPush(transfer.length > 0 ? Comlink.transfer(msg, transfer) : msg)
-      .catch((err: unknown) => {
-        console.error("[rWasmWorker] deliverWsPush failed:", formatRWasmError(err), err);
-      });
-  }
 }
 
 function formatRWasmError(err: unknown): string {
@@ -259,49 +154,56 @@ function replyErr(id: unknown, err: unknown): void {
   });
 }
 
-function scheduleRDrain(): void {
-  if (rDrainScheduled) {
-    return;
-  }
-  rDrainScheduled = true;
-  scheduleMacrotask(drainRTaskQueue);
+function logHttpDeliveryError(err: unknown, url?: string): void {
+  const where = url ? ` ${url}` : "";
+  console.error(`[rWasmWorker] deliverHttpRequest failed:${where}`, formatRWasmError(err), err);
 }
 
-function drainRTaskQueue(): void {
-  rDrainScheduled = false;
-  if (!rModule || rTaskQueue.length === 0) {
+function deliverToServiceWorker(outbound: OutboundMessage, transfer: Transferable[] = []): void {
+  const t = requireTransport();
+  if (!swDelivery) {
+    console.warn("[rWasmWorker] Service worker delivery API not connected");
+    return;
+  }
+  pump.markActivity();
+
+  if (outbound.type === t.MSG.HTTP_RESPONSE) {
+    dbg("comlink-deliver-http", { uuid: outbound.uuid, status: outbound.status });
+    http.noteHttpResponse(outbound.uuid);
+    const resp = {
+      uuid: outbound.uuid,
+      status: outbound.status,
+      headers: outbound.headers,
+      body: outbound.body,
+    };
+    void swDelivery
+      .deliverHttpResponse(transfer.length > 0 ? Comlink.transfer(resp, transfer) : resp)
+      .catch((err: unknown) => {
+        console.error("[rWasmWorker] deliverHttpResponse failed:", formatRWasmError(err), err);
+      });
     return;
   }
 
-  const task = rTaskQueue.shift();
-  if (!task) {
-    return;
+  if (outbound.type === t.MSG.WS_PUSH) {
+    const handle = t.normalizeSessionHandle(outbound.handle);
+    const msg = {
+      handle,
+      binary: outbound.binary,
+      wsType: outbound.wsType,
+      message: outbound.message,
+    };
+    dbg("comlink-deliver-ws", {
+      handle,
+      wsType: outbound.wsType,
+      binary: outbound.binary,
+      messageLen: messageBodyLength(outbound.message),
+    });
+    void swDelivery
+      .deliverWsPush(transfer.length > 0 ? Comlink.transfer(msg, transfer) : msg)
+      .catch((err: unknown) => {
+        console.error("[rWasmWorker] deliverWsPush failed:", formatRWasmError(err), err);
+      });
   }
-  rLocked = true;
-  try {
-    task.work();
-    task.resolve();
-  } catch (err) {
-    task.reject(err);
-  } finally {
-    rLocked = false;
-    transport?.flushDeferredOutbound();
-  }
-
-  if (rTaskQueue.length > 0) {
-    scheduleRDrain();
-  }
-}
-
-/**
- * Queue work that calls evalR. Tasks run one at a time on setTimeout(0) turns
- * so later's emscripten timers can run while the worker is idle.
- */
-function enqueueRTask(work: () => void): Promise<void> {
-  return new Promise((resolve, reject) => {
-    rTaskQueue.push({ work, resolve, reject });
-    scheduleRDrain();
-  });
 }
 
 function pushToR(msg: ChannelMessageLike): void {
@@ -321,7 +223,7 @@ function pushToR(msg: ChannelMessageLike): void {
       messageLen: messageBodyLength(msg.message),
     });
   }
-  evalRNow(`tryCatch({
+  tasks.evalRNow(`tryCatch({
   ${t.channelMessageToRExpr(msg)}
 }, error=function(e) {
   msg <- paste0("[httpuv] push failed (", ${JSON.stringify(String(msg.url ?? ""))}, "): ", conditionMessage(e))
@@ -331,286 +233,6 @@ function pushToR(msg: ChannelMessageLike): void {
   if (msg?.uuid) {
     dbg("worker-push-evalR-finish", { uuid: msg.uuid });
   }
-}
-
-/** Yield between drain rounds so emscripten later timers can fire. */
-const HTTP_DRAIN_YIELD_MS = 4;
-
-function yieldMs(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
-}
-
-/**
- * Wait for the HTTP response with no evalR — emscripten later timers need a
- * quiet worker. Background pump is paused via httpDeliveryActive.
- */
-async function idleWaitForHttpResponse(
-  state: { resolved: boolean },
-  uuid: string,
-  maxMs = HTTP_IDLE_MAX_MS,
-): Promise<void> {
-  const start = Date.now();
-  while (!state.resolved && Date.now() - start < maxMs) {
-    await yieldMs(HTTP_IDLE_POLL_MS);
-  }
-  dbg("worker-push-idle-done", {
-    uuid,
-    resolved: state.resolved,
-    waitedMs: Date.now() - start,
-  });
-}
-
-function isStaticAssetUrl(url: string): boolean {
-  return requireTransport().isLikelyStaticAsset(url);
-}
-
-function isSessionHttpUrl(url: string): boolean {
-  const t = requireTransport();
-  try {
-    return t.isSessionHttpRequest(url, t.getShinyPrefix());
-  } catch {
-    return t.isSessionHttpRequest(url);
-  }
-}
-
-async function ensureShinyLoopSuspended(): Promise<void> {
-  if (shinyLoopSuspended || !rModule) {
-    return;
-  }
-  await enqueueRTask(() => {
-    evalRNow(WASM_SUSPEND_SHINY_LOOP);
-  });
-  shinyLoopSuspended = true;
-  dbg("worker-shiny-loop-suspend", {});
-}
-
-async function ensureShinyLoopResumed(): Promise<void> {
-  if (!shinyLoopSuspended || !rModule) {
-    return;
-  }
-  await enqueueRTask(() => {
-    evalRNow(WASM_RESUME_SHINY_LOOP);
-  });
-  shinyLoopSuspended = false;
-  dbg("worker-shiny-loop-resume", {});
-}
-
-async function maybeFinishHttpDeliveryBatch(): Promise<void> {
-  if (httpDeliveryQueue.length > 0 || httpDeliveryInflight > 0) {
-    return;
-  }
-  await ensureShinyLoopResumed();
-  httpDeliveryActive = false;
-  httpDeliveryDraining = false;
-}
-
-async function deliverOneHttpRequest(req: HostInboundMessage): Promise<void> {
-  const uuid = req.uuid ?? "";
-  const url = req.url ?? "";
-  const state = { resolved: false };
-  httpDrainByUuid.set(uuid, state);
-  httpDeliveryInflight++;
-  activeHttpDrainUuid = uuid;
-
-  const staticAsset = isStaticAssetUrl(url);
-  const sessionHttp = isSessionHttpUrl(url);
-
-  try {
-    await enqueueRTask(() => {
-      requireTransport().pushInboundHostMessage(req);
-    });
-
-    if (!staticAsset) {
-      await idleWaitForHttpResponse(state, uuid, HTTP_IDLE_MAX_MS);
-
-      if (!state.resolved) {
-        await drainAfterHttpPush(HTTP_PUSH_DRAIN_ROUNDS, uuid, state);
-      } else if (sessionHttp) {
-        // Session send/open return 204/200 immediately while Shiny still
-        // flushes outputs onto the virtual WebSocket via later.
-        dbg("worker-session-drain", { uuid });
-        await drainAfterHttpPush(HTTP_PUSH_DRAIN_ROUNDS, uuid, { resolved: false });
-      }
-    } else if (!state.resolved) {
-      await yieldMs(HTTP_DRAIN_YIELD_MS);
-    }
-  } finally {
-    httpDrainByUuid.delete(uuid);
-    if (activeHttpDrainUuid === uuid) {
-      activeHttpDrainUuid = null;
-    }
-    httpDeliveryInflight--;
-  }
-}
-
-async function drainHttpDeliveryQueue(): Promise<void> {
-  while (httpDeliveryQueue.length > 0) {
-    const item = httpDeliveryQueue.shift();
-    if (!item) {
-      break;
-    }
-    const itemUrl = item.req.url ?? "";
-    const needsSuspend = !isStaticAssetUrl(itemUrl) && !isSessionHttpUrl(itemUrl);
-    if (needsSuspend && !shinyLoopSuspended) {
-      await ensureShinyLoopSuspended();
-    }
-    if (needsSuspend) {
-      httpDeliveryActive = true;
-    }
-    try {
-      await deliverOneHttpRequest(item.req);
-      item.resolve();
-    } catch (err) {
-      logHttpDeliveryError(err, itemUrl);
-      item.reject(err);
-    } finally {
-      if (needsSuspend) {
-        httpDeliveryActive = false;
-      }
-    }
-    const next = httpDeliveryQueue[0];
-    const nextUrl = next?.req.url ?? "";
-    const nextNeedsSuspend = Boolean(
-      next && !isStaticAssetUrl(nextUrl) && !isSessionHttpUrl(nextUrl),
-    );
-    if (shinyLoopSuspended && !nextNeedsSuspend) {
-      await ensureShinyLoopResumed();
-    }
-  }
-
-  await maybeFinishHttpDeliveryBatch();
-
-  if (httpDeliveryQueue.length > 0 && !httpDeliveryDraining) {
-    httpDeliveryDraining = true;
-    void drainHttpDeliveryQueue();
-  }
-}
-
-function drainAfterHttpPush(
-  roundsLeft: number,
-  uuid: string,
-  state: { resolved: boolean },
-): Promise<void> {
-  if (roundsLeft <= 0 || !rModule || state.resolved) {
-    if (!state.resolved) {
-      dbg("worker-push-drain-exhausted", { uuid, roundsLeft });
-    }
-    return Promise.resolve();
-  }
-  return new Promise((resolve) => {
-    scheduleMacrotask(() => {
-      void enqueueRTask(() => {
-        evalRNow(WASM_SERVICE_ONCE);
-      })
-        .then(() => drainAfterHttpPush(roundsLeft - 1, uuid, state))
-        .then(resolve);
-    });
-  });
-}
-
-/**
- * Idle service pump. While there has been recent traffic it rides the
- * unthrottled macrotask loop (surviving background throttling); once quiet it
- * backs off to a plain timer so an idle app costs nothing. Real evalR ticks are
- * still spaced by PUMP_INTERVAL_MS; the macrotask turns in between are cheap.
- */
-function schedulePump(viaMacrotask: boolean, delayMs = 0): void {
-  if (pumpScheduled) {
-    return;
-  }
-  pumpScheduled = true;
-  pumpViaMacrotask = viaMacrotask;
-  if (viaMacrotask) {
-    scheduleMacrotask(() => {
-      pumpScheduled = false;
-      pumpOnce();
-    });
-  } else {
-    pumpTimer = setTimeout(() => {
-      pumpTimer = null;
-      pumpScheduled = false;
-      pumpOnce();
-    }, delayMs);
-  }
-}
-
-function pumpOnce(): void {
-  if (!rModule) {
-    return;
-  }
-
-  const now = Date.now();
-  if (
-    now - lastPumpTickTs >= PUMP_INTERVAL_MS &&
-    !rLocked &&
-    rTaskQueue.length === 0 &&
-    !httpDeliveryActive
-  ) {
-    lastPumpTickTs = now;
-    void enqueueRTask(() => {
-      evalRNow(WASM_SERVICE_ONCE);
-    }).catch((err) => {
-      console.warn("[rWasmWorker] later pump failed:", formatRWasmError(err));
-    });
-  }
-
-  const active =
-    now - lastActivityTs < ACTIVE_WINDOW_MS ||
-    httpDeliveryInflight > 0 ||
-    httpDeliveryQueue.length > 0;
-  schedulePump(active, active ? 0 : IDLE_PUMP_MS);
-}
-
-/**
- * Note inbound/outbound traffic so the pump re-enters the unthrottled macrotask
- * loop promptly (rather than waiting out the current idle-backoff timer).
- */
-function markActivity(): void {
-  lastActivityTs = Date.now();
-  if (pumpStarted && !pumpViaMacrotask && pumpTimer !== null) {
-    clearTimeout(pumpTimer);
-    pumpTimer = null;
-    pumpScheduled = false;
-    schedulePump(true, 0);
-  }
-}
-
-function ensureRLaterPump(): void {
-  if (pumpStarted) {
-    return;
-  }
-  pumpStarted = true;
-  lastActivityTs = Date.now();
-  schedulePump(true, 0);
-  dbg("later-pump", { intervalMs: PUMP_INTERVAL_MS, driver: "message-loop" });
-}
-
-function logHttpDeliveryError(err: unknown, url?: string): void {
-  const where = url ? ` ${url}` : "";
-  console.error(`[rWasmWorker] deliverHttpRequest failed:${where}`, formatRWasmError(err), err);
-}
-
-/**
- * Queue one HTTP request. Requests run strictly one-at-a-time; Shiny's
- * service loop is suspended once for the whole batch.
- */
-function enqueueHttpDelivery(req: HostInboundMessage): Promise<void> {
-  markActivity();
-  dbg("worker-push", { uuid: req.uuid, method: req.method, url: req.url });
-
-  return new Promise((resolve, reject) => {
-    httpDeliveryQueue.push({ req, resolve, reject });
-    if (!httpDeliveryDraining) {
-      httpDeliveryDraining = true;
-      void drainHttpDeliveryQueue().catch((err) => {
-        httpDeliveryDraining = false;
-        httpDeliveryActive = false;
-        logHttpDeliveryError(err);
-      });
-    }
-  });
 }
 
 function installBridge(t: HttpuvTransport): void {
@@ -633,7 +255,7 @@ function installBridge(t: HttpuvTransport): void {
 
 async function initEverything(): Promise<RModule> {
   transport = await loadTransport(config.transportBaseUrl);
-  HTTP_IDLE_MAX_MS = transport.REQUEST_TIMEOUT_MS;
+  http.setIdleMaxMs(transport.REQUEST_TIMEOUT_MS);
   const assetBaseUrl = new URL(config.rRuntimeBaseUrl, self.location.href).href;
   rAssetBaseUrl = assetBaseUrl;
   const module = await initRModule({
@@ -644,7 +266,7 @@ async function initEverything(): Promise<RModule> {
   });
   rModule = module;
   installBridge(transport);
-  ensureRLaterPump();
+  pump.ensureRLaterPump();
   return module;
 }
 
@@ -675,7 +297,7 @@ function readVfsFile(vfsDir: string, suffix: string): Promise<ArrayBuffer | null
 
 function readShinyResourcePathsFromR(): Record<string, string> {
   const module = requireRModule();
-  evalRNow(`tryCatch({
+  tasks.evalRNow(`tryCatch({
   paths <- if (requireNamespace("shiny", quietly=TRUE)) as.list(shiny::resourcePaths()) else list()
   jsonlite::write_json(paths, "/resourcePaths.json", auto_unbox=TRUE)
 }, error=function(e) {
@@ -696,9 +318,11 @@ function readShinyResourcePathsFromR(): Record<string, string> {
 function getShinyResourcePaths(): Promise<Record<string, string>> {
   return ensureRModule().then(() => {
     let result: Record<string, string> = {};
-    return enqueueRTask(() => {
-      result = readShinyResourcePathsFromR();
-    }).then(() => result);
+    return tasks
+      .enqueueRTask(() => {
+        result = readShinyResourcePathsFromR();
+      })
+      .then(() => result);
   });
 }
 
@@ -707,7 +331,7 @@ function exposeRHost(port: MessagePort): void {
   const api = createRHostApi(t.MSG.HTTP_REQUEST, {
     onHttpRequest: (req) =>
       ensureRModule()
-        .then(() => enqueueHttpDelivery(req))
+        .then(() => http.enqueueHttpDelivery(req))
         .catch((err) => {
           logHttpDeliveryError(err);
           throw err;
@@ -715,9 +339,9 @@ function exposeRHost(port: MessagePort): void {
     onStop: () => {
       void ensureRModule()
         .then(() => {
-          void enqueueRTask(() => {
+          void tasks.enqueueRTask(() => {
             requireTransport().pushInboundHostMessage({ type: t.MSG.STOP });
-            evalRNow(WASM_STOP_EXPR);
+            tasks.evalRNow(SHINY_HOST.stop);
           });
         })
         .catch((err) => {
@@ -746,8 +370,8 @@ function stopRunningApp(): Promise<void> {
   if (!rModule) {
     return Promise.resolve();
   }
-  return enqueueRTask(() => {
-    evalRNow(WASM_STOP_EXPR);
+  return tasks.enqueueRTask(() => {
+    tasks.evalRNow(SHINY_HOST.stop);
   }).catch((err) => {
     log("error", `[rWasmWorker] stopApp failed: ${formatRWasmError(err)}`);
   });
@@ -771,7 +395,7 @@ async function onMessage(event: MessageEvent): Promise<void> {
     return;
   }
 
-  markActivity();
+  pump.markActivity();
 
   switch (data.type) {
     case RWASM.WRITE_WEB_APP_FILES: {
@@ -789,7 +413,7 @@ async function onMessage(event: MessageEvent): Promise<void> {
     case RWASM.EVAL: {
       try {
         const module = await ensureRModule();
-        await enqueueRTask(() => {
+        await tasks.enqueueRTask(() => {
           evalR(module, String(data.code ?? ""));
         });
         replyOk(data.id);
