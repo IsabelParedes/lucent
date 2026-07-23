@@ -93,6 +93,46 @@ export function vfsPathToFetchUrl(
   return new URL(`${prefix}${vfsPath}`, new URL(baseUrl, self.location.href)).href;
 }
 
+/** Parallel fetches when mounting the wasm prefix (keep modest for GitHub Pages). */
+const MOUNT_FETCH_CONCURRENCY = 6;
+const MOUNT_FETCH_ATTEMPTS = 6;
+const TRANSIENT_HTTP = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Fetch with retries on transient CDN/gateway failures (common on GitHub Pages
+ * when mounting thousands of prefix files). Uses the default browser cache so
+ * reloads are not forced to re-download the whole tree.
+ */
+async function fetchWithRetry(url: string, attempts = MOUNT_FETCH_ATTEMPTS): Promise<Response> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const res = await fetch(url);
+      if (res.ok || !TRANSIENT_HTTP.has(res.status) || attempt === attempts) {
+        return res;
+      }
+      lastError = new Error(`HTTP ${res.status}`);
+      console.warn(
+        `[rWasm] HTTP ${res.status} for ${url}; retry ${attempt}/${attempts}`,
+      );
+    } catch (err) {
+      lastError = err;
+      if (attempt === attempts) {
+        throw err;
+      }
+      console.warn(`[rWasm] fetch failed for ${url}; retry ${attempt}/${attempts}`, err);
+    }
+    const backoffMs =
+      Math.min(8_000, 250 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 250);
+    await sleep(backoffMs);
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
 export async function mountRHome(
   baseUrl: string,
   hostPrefixDir?: string,
@@ -101,20 +141,26 @@ export async function mountRHome(
   const fileCache = new Map<string, Uint8Array>();
   const { manifest } = createAssetUrls(baseUrl, prefix);
 
-  const res = await fetch(manifest, { cache: "no-store" });
+  const res = await fetchWithRetry(manifest.href);
   if (!res.ok) {
     throw new Error(`Failed to fetch ${manifest.href}: HTTP ${res.status}`);
   }
   const { files } = (await res.json()) as { files: string[] };
-  console.info("[rWasm] Mounting", files.length, "files from manifest");
+  console.info(
+    "[rWasm] Mounting",
+    files.length,
+    "files from manifest (concurrency",
+    MOUNT_FETCH_CONCURRENCY,
+    ")",
+  );
 
   let next = 0;
   await Promise.all(
-    Array.from({ length: 32 }, async () => {
+    Array.from({ length: MOUNT_FETCH_CONCURRENCY }, async () => {
       while (next < files.length) {
         const dst = files[next++];
         const fetchUrl = vfsPathToFetchUrl(baseUrl, dst, prefix);
-        const fileRes = await fetch(fetchUrl, { cache: "no-store" });
+        const fileRes = await fetchWithRetry(fetchUrl);
         if (!fileRes.ok) {
           throw new Error(`Failed to fetch ${fetchUrl}: HTTP ${fileRes.status}`);
         }
