@@ -56,7 +56,7 @@ export function createAssetUrls(baseUrl: string, hostPrefixDir?: string): AssetU
   const base = new URL(baseUrl, self.location.href);
   const hostPrefix = hostPrefixBase(baseUrl, prefix);
   return {
-    glue: new URL("bin/Rmain", hostPrefix),
+    glue: new URL("bin/Rmain.js", hostPrefix),
     wasm: new URL("bin/Rmain.wasm", hostPrefix),
     manifest: new URL(`${prefix}-manifest.json`, base),
   };
@@ -167,22 +167,22 @@ export function verifyMountedTree(module: RModule): void {
   }
 }
 
-/** Fetch Rmain glue and return the MODULARIZE factory (`EXPORT_NAME=Rmain`). */
+/** Load the MODULARIZE factory from Rmain.js (`EXPORT_ES6` + `EXPORT_NAME=Rmain`). */
 async function loadRmainFactory(
   baseUrl: string,
   hostPrefixDir?: string,
 ): Promise<RmainFactory> {
   const { glue: glueUrl } = createAssetUrls(baseUrl, hostPrefixDir);
-  const src = await fetch(glueUrl).then((res) => {
-    if (!res.ok) {
-      throw new Error(`Failed to fetch ${glueUrl.href}: HTTP ${res.status}`);
-    }
-    return res.text();
-  });
-  // Evaluate in a function scope so `var Rmain = ...` does not need globalThis.
-  const factory = new Function(`${src}\nreturn Rmain;`)() as RmainFactory;
+  // Absolute same-origin URL; do not let the bundler try to resolve it at build time.
+  const mod = (await import(/* webpackIgnore: true */ glueUrl.href)) as {
+    default?: RmainFactory;
+    Rmain?: RmainFactory;
+  };
+  const factory = mod.default ?? mod.Rmain;
   if (typeof factory !== "function") {
-    throw new Error("Rmain factory missing; rebuild r-main with -sMODULARIZE=1 -sEXPORT_NAME=Rmain");
+    throw new Error(
+      "Rmain factory missing; rebuild r-main with -sMODULARIZE=1 -sEXPORT_NAME=Rmain -sEXPORT_ES6=1",
+    );
   }
   return factory;
 }
