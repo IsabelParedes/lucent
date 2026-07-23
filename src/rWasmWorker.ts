@@ -7,7 +7,6 @@ import {
   remountRHome,
   setEvalRPostFlush,
   writeWebAppFilesToVfs,
-  writeWebAppToVfs,
   type RModule,
   type WebAppFile,
 } from "./rWasmBootstrap";
@@ -54,37 +53,14 @@ const WASM_STOP_EXPR = `tryCatch({
   }
 }, error=function(e) NULL)`;
 
-// Suspend Shiny's serviceNonBlocking loop without patching the installed package:
-// bump serviceGeneration so in-flight serviceLoop callbacks exit (see
-// shiny/tests/testthat/test-non-blocking.R). Resume via serviceNonBlocking().
-const WASM_SUSPEND_SHINY_LOOP = `tryCatch({
-  if (requireNamespace("shiny", quietly=TRUE) && shiny::isRunning()) {
-    shiny:::.globals$serviceGeneration <- shiny:::.globals$serviceGeneration + 1L
-  }
-}, error=function(e) NULL)`;
+const WASM_SUSPEND_SHINY_LOOP =
+  `tryCatch(shiny::suspendServiceLoop(), error=function(e) NULL)`;
 
-const WASM_RESUME_SHINY_LOOP = `tryCatch({
-  if (requireNamespace("shiny", quietly=TRUE) && shiny::isRunning()) {
-    h <- shiny:::.globals$runningHandle
-    if (!is.null(h)) {
-      shiny:::serviceNonBlocking(h, shiny:::.globals$serviceGeneration)
-    }
-  }
-}, error=function(e) NULL)`;
+const WASM_RESUME_SHINY_LOOP =
+  `tryCatch(shiny::resumeServiceLoop(), error=function(e) NULL)`;
 
-/** Background pump when the R task queue is idle. */
-const WASM_SINGLE_SERVICE_TICK = `tryCatch({
-  has_srv <- requireNamespace("shiny", quietly=TRUE) &&
-    !is.null(shiny::getShinyOption("server", default=NULL))
-  if (has_srv) {
-    shiny::serviceApp(NA)
-  } else if (!later::loop_empty()) {
-    later::run_now(0, all=FALSE)
-  }
-}, error=function(e) NULL)`;
-
-/** Host-controlled service tick while Shiny's serviceLoop is suspended. */
-const WASM_HTTP_DRAIN_TICK = WASM_SINGLE_SERVICE_TICK;
+const WASM_SERVICE_ONCE =
+  `tryCatch(shiny::serviceOnce(), error=function(e) NULL)`;
 
 /** Service rounds after push idle wait (promise resolution only). */
 const HTTP_PUSH_DRAIN_ROUNDS = 128;
@@ -507,7 +483,7 @@ function drainAfterHttpPush(
   return new Promise((resolve) => {
     scheduleMacrotask(() => {
       void enqueueRTask(() => {
-        evalRNow(WASM_HTTP_DRAIN_TICK);
+        evalRNow(WASM_SERVICE_ONCE);
       })
         .then(() => drainAfterHttpPush(roundsLeft - 1, uuid, state))
         .then(resolve);
@@ -555,7 +531,7 @@ function pumpOnce(): void {
   ) {
     lastPumpTickTs = now;
     void enqueueRTask(() => {
-      evalRNow(WASM_SINGLE_SERVICE_TICK);
+      evalRNow(WASM_SERVICE_ONCE);
     }).catch((err) => {
       console.warn("[rWasmWorker] later pump failed:", formatRWasmError(err));
     });
@@ -644,6 +620,7 @@ async function initEverything(): Promise<RModule> {
   rAssetBaseUrl = assetBaseUrl;
   const module = await initRModule({
     assetBaseUrl,
+    hostPrefixDir: config.hostPrefixDir,
     httpuv: (globalThis.Module as { httpuv?: unknown } | undefined)?.httpuv,
     print: (text) => log("log", text),
     printErr: (text) => log("error", text),
@@ -779,35 +756,6 @@ async function onMessage(event: MessageEvent): Promise<void> {
   markActivity();
 
   switch (data.type) {
-    case RWASM.INIT: {
-      try {
-        await ensureRModule();
-        postToHost({ type: RWASM.READY });
-      } catch (err) {
-        postToHost({
-          type: RWASM.ERROR,
-          message: err instanceof Error ? err.message : String(err),
-        });
-      }
-      break;
-    }
-
-    case RWASM.WRITE_WEB_APP: {
-      try {
-        const module = await ensureRModule();
-        writeWebAppToVfs(module, String(data.source ?? ""));
-        postToHost({ type: RWASM.EVAL_RESULT, id: data.id, ok: true });
-      } catch (err) {
-        postToHost({
-          type: RWASM.EVAL_RESULT,
-          id: data.id,
-          ok: false,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-      break;
-    }
-
     case RWASM.WRITE_WEB_APP_FILES: {
       try {
         const module = await ensureRModule();
@@ -855,7 +803,7 @@ async function onMessage(event: MessageEvent): Promise<void> {
         if (!rAssetBaseUrl) {
           throw new Error("R asset base URL is not set");
         }
-        await remountRHome(requireRModule(), rAssetBaseUrl);
+        await remountRHome(requireRModule(), rAssetBaseUrl, config.hostPrefixDir);
         if (data.id != null) {
           postToHost({ type: RWASM.EVAL_RESULT, id: data.id, ok: true });
         }

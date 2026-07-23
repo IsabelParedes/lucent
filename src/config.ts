@@ -1,4 +1,4 @@
-import { HOST_PREFIX, WASM_R_HOME } from "./rWasmBootstrap";
+import { HOST_PREFIX, WASM_R_HOME } from "./rwasm-constants";
 
 export interface LucentConfig {
   /** Base URL where the r-httpuv transport assets (httpuv-web.js, httpuv-sw.js, ...) are served. */

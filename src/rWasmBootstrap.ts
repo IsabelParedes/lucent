@@ -1,4 +1,4 @@
-import type { RMainModule } from "./rWasmEval";
+import { HOST_PREFIX, WASM_R_HOME, WEB_APP_DIR } from "./rwasm-constants";
 
 /** Emscripten MODULARIZE factory exported as EXPORT_NAME=Rmain. */
 type RmainFactory = (config: Record<string, unknown>) => Promise<RModule>;
@@ -13,9 +13,11 @@ export interface EmscriptenFS {
   analyzePath(path: string): { exists: boolean };
 }
 
-/** Minimal view of the initialized Rmain module. */
-export interface RModule extends RMainModule {
+/** Minimal view of the initialized Rmain module (initR / evalR from rmain_post.js). */
+export interface RModule {
   FS: EmscriptenFS;
+  initR: (args?: string[]) => number;
+  evalR: (code: string) => unknown;
   _rWasmEvalDepth: number;
   [key: string]: unknown;
 }
@@ -23,6 +25,8 @@ export interface RModule extends RMainModule {
 export interface InitRModuleOptions {
   /** Base URL of the site root (manifest, host prefix tree). */
   assetBaseUrl: string;
+  /** Host directory name under assetBaseUrl for the wasm prefix tree. */
+  hostPrefixDir?: string;
   httpuv?: unknown;
   print?: (text: string) => void;
   printErr?: (text: string) => void;
@@ -34,39 +38,36 @@ export function setEvalRPostFlush(fn: () => void): void {
   evalRPostFlush = fn;
 }
 
-/** Host directory name under assetBaseUrl where the wasm prefix is served. */
-export const HOST_PREFIX = "_env-wasm";
-
-/** R_HOME inside the mounted prefix (VFS root is /). */
-export const WASM_R_HOME = "/lib/R";
-
-export const WEB_APP_DIR = "/webApp";
-export const WEB_APP_R = `${WEB_APP_DIR}/app.R`;
-
-const VFS_SKIP = new Set([`${WASM_R_HOME}/etc/ldpaths`, `${WASM_R_HOME}/etc/Makeconf`]);
-
 interface AssetUrls {
   glue: URL;
   wasm: URL;
   manifest: URL;
 }
 
-function hostPrefixBase(baseUrl: string): URL {
-  return new URL(`${HOST_PREFIX}/`, new URL(baseUrl, self.location.href));
+function resolveHostPrefixDir(hostPrefixDir?: string): string {
+  return hostPrefixDir ?? HOST_PREFIX;
 }
 
-export function createAssetUrls(baseUrl: string): AssetUrls {
+function hostPrefixBase(baseUrl: string, hostPrefixDir: string): URL {
+  return new URL(`${hostPrefixDir}/`, new URL(baseUrl, self.location.href));
+}
+
+export function createAssetUrls(baseUrl: string, hostPrefixDir?: string): AssetUrls {
+  const prefix = resolveHostPrefixDir(hostPrefixDir);
   const base = new URL(baseUrl, self.location.href);
-  const hostPrefix = hostPrefixBase(baseUrl);
+  const hostPrefix = hostPrefixBase(baseUrl, prefix);
   return {
     glue: new URL("bin/Rmain", hostPrefix),
     wasm: new URL("bin/Rmain.wasm", hostPrefix),
-    manifest: new URL("_env-wasm-manifest.json", base),
+    manifest: new URL(`${prefix}-manifest.json`, base),
   };
 }
 
-export function createLocateFile(baseUrl: string): (file: string) => string {
-  const hostPrefix = hostPrefixBase(baseUrl);
+export function createLocateFile(
+  baseUrl: string,
+  hostPrefixDir?: string,
+): (file: string) => string {
+  const hostPrefix = hostPrefixBase(baseUrl, resolveHostPrefixDir(hostPrefixDir));
   return function locateFile(file: string): string {
     const fileBase = file.split("/").pop() ?? file;
     if (fileBase.endsWith(".wasm")) {
@@ -81,16 +82,25 @@ export function createLocateFile(baseUrl: string): (file: string) => string {
 }
 
 /** Map an absolute VFS path to the HTTP URL under the host prefix tree. */
-export function vfsPathToFetchUrl(baseUrl: string, vfsPath: string): string {
+export function vfsPathToFetchUrl(
+  baseUrl: string,
+  vfsPath: string,
+  hostPrefixDir?: string,
+): string {
   if (!vfsPath.startsWith("/")) {
     throw new Error(`Expected absolute VFS path: ${vfsPath}`);
   }
-  return new URL(`${HOST_PREFIX}${vfsPath}`, new URL(baseUrl, self.location.href)).href;
+  const prefix = resolveHostPrefixDir(hostPrefixDir);
+  return new URL(`${prefix}${vfsPath}`, new URL(baseUrl, self.location.href)).href;
 }
 
-export async function mountRHome(baseUrl: string): Promise<Map<string, Uint8Array>> {
+export async function mountRHome(
+  baseUrl: string,
+  hostPrefixDir?: string,
+): Promise<Map<string, Uint8Array>> {
+  const prefix = resolveHostPrefixDir(hostPrefixDir);
   const fileCache = new Map<string, Uint8Array>();
-  const { manifest } = createAssetUrls(baseUrl);
+  const { manifest } = createAssetUrls(baseUrl, prefix);
 
   const res = await fetch(manifest, { cache: "no-store" });
   if (!res.ok) {
@@ -104,10 +114,7 @@ export async function mountRHome(baseUrl: string): Promise<Map<string, Uint8Arra
     Array.from({ length: 32 }, async () => {
       while (next < files.length) {
         const dst = files[next++];
-        if (VFS_SKIP.has(dst)) {
-          continue;
-        }
-        const fetchUrl = vfsPathToFetchUrl(baseUrl, dst);
+        const fetchUrl = vfsPathToFetchUrl(baseUrl, dst, prefix);
         const fileRes = await fetch(fetchUrl, { cache: "no-store" });
         if (!fileRes.ok) {
           throw new Error(`Failed to fetch ${fetchUrl}: HTTP ${fileRes.status}`);
@@ -162,8 +169,11 @@ export function verifyMountedTree(module: RModule): void {
 }
 
 /** Fetch Rmain glue and return the MODULARIZE factory (`EXPORT_NAME=Rmain`). */
-async function loadRmainFactory(baseUrl: string): Promise<RmainFactory> {
-  const { glue: glueUrl } = createAssetUrls(baseUrl);
+async function loadRmainFactory(
+  baseUrl: string,
+  hostPrefixDir?: string,
+): Promise<RmainFactory> {
+  const { glue: glueUrl } = createAssetUrls(baseUrl, hostPrefixDir);
   const src = await fetch(glueUrl).then((res) => {
     if (!res.ok) {
       throw new Error(`Failed to fetch ${glueUrl.href}: HTTP ${res.status}`);
@@ -179,9 +189,6 @@ async function loadRmainFactory(baseUrl: string): Promise<RmainFactory> {
 }
 
 export function evalR(Module: RModule, code: string): unknown {
-  if (typeof Module.evalR !== "function") {
-    throw new Error("Module.evalR is missing; Rmain was not built with rmain_post.js");
-  }
   if (Module._rWasmEvalDepth > 0) {
     throw new Error("reentrant evalR");
   }
@@ -194,8 +201,12 @@ export function evalR(Module: RModule, code: string): unknown {
   }
 }
 
-export async function remountRHome(Module: RModule, assetBaseUrl: string): Promise<void> {
-  const fileCache = await mountRHome(assetBaseUrl);
+export async function remountRHome(
+  Module: RModule,
+  assetBaseUrl: string,
+  hostPrefixDir?: string,
+): Promise<void> {
+  const fileCache = await mountRHome(assetBaseUrl, hostPrefixDir);
   writeCachedTree(Module, fileCache);
   mountRHomeLibToSlashLib(Module, fileCache);
   verifyMountedTree(Module);
@@ -235,17 +246,9 @@ export async function bootstrapRSession(Module: RModule): Promise<void> {
     throw new Error(`R init failed with status ${status}`);
   }
 
-  evalR(Module, "2+4");
-
   evalR(Module, "suppressPackageStartupMessages(library(httpuv))");
   evalR(Module, 'setwd("/")');
   console.info("[rWasm] R session ready");
-}
-
-export function writeWebAppToVfs(Module: RModule, source: string): void {
-  Module.FS.mkdirTree(WEB_APP_DIR);
-  Module.FS.writeFile(WEB_APP_R, source);
-  console.info("[rWasm] Wrote", WEB_APP_R, `(${source.length} bytes)`);
 }
 
 /** A single Shiny app file, path relative to the app directory. */
@@ -278,16 +281,18 @@ export function writeWebAppFilesToVfs(Module: RModule, files: WebAppFile[]): voi
  */
 export async function initRModule({
   assetBaseUrl,
+  hostPrefixDir,
   httpuv,
   print,
   printErr,
 }: InitRModuleOptions): Promise<RModule> {
-  const fileCache = await mountRHome(assetBaseUrl);
-  const locateFile = createLocateFile(assetBaseUrl);
-  const { wasm: wasmUrl } = createAssetUrls(assetBaseUrl);
+  const prefix = resolveHostPrefixDir(hostPrefixDir);
+  const fileCache = await mountRHome(assetBaseUrl, prefix);
+  const locateFile = createLocateFile(assetBaseUrl, prefix);
+  const { wasm: wasmUrl } = createAssetUrls(assetBaseUrl, prefix);
 
   const [createRmain, wasmBinary] = await Promise.all([
-    loadRmainFactory(assetBaseUrl),
+    loadRmainFactory(assetBaseUrl, prefix),
     fetch(wasmUrl).then((res) => {
       if (!res.ok) {
         throw new Error(`Failed to fetch ${wasmUrl.href}: HTTP ${res.status}`);
@@ -303,7 +308,12 @@ export async function initRModule({
     wasmBinary,
     locateFile,
     httpuv: httpuv ?? globalThis.Module?.httpuv,
-    preRun: [() => writeCachedTree(module, fileCache)],
+    preRun: [
+      () => {
+        writeCachedTree(module, fileCache);
+        mountRHomeLibToSlashLib(module, fileCache);
+      },
+    ],
     onAbort(reason: unknown) {
       throw new Error(`Rmain aborted: ${String(reason)}`);
     },
@@ -321,8 +331,6 @@ export async function initRModule({
     throw err instanceof Error ? err : new Error(String(err));
   }
 
-  writeCachedTree(module, fileCache);
-  mountRHomeLibToSlashLib(module, fileCache);
   verifyMountedTree(module);
   await bootstrapRSession(module);
 

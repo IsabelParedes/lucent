@@ -3,15 +3,6 @@ import { RWASM } from "./rwasm-constants";
 import { loadTransport, type HttpuvTransport } from "./transport";
 import { connectHttpuvComlink } from "./wiring";
 
-const SETUP_WASM_PLOT_CACHE_R = `tryCatch({
-  cacheDir <- "/tmp/shiny-plots"
-  dir.create(cacheDir, showWarnings = FALSE, recursive = TRUE)
-  options(shiny.wasm.plotUrl = TRUE)
-  options(shiny.wasm.plotCacheDir = cacheDir)
-  options(shiny.wasm.plotUrlPrefix = "shiny-plots")
-  shiny::addResourcePath("shiny-plots", cacheDir)
-}, error = function(e) warning("wasm plot cache setup: ", conditionMessage(e)))`;
-
 const RUN_WEB_APP_R = `shiny::startApp(appDir = "webApp", port = 3838L, host = "127.0.0.1", launch.browser = FALSE, quiet = TRUE)`;
 
 const config: LucentConfig = resolveLucentConfig();
@@ -529,12 +520,6 @@ export async function runApp(files: AppFile[]): Promise<number> {
 
   const transfer = files.map((f) => f.data.buffer as ArrayBuffer);
   await postToRWorker(worker, { type: RWASM.WRITE_WEB_APP_FILES, files }, transfer);
-
-  console.info("[runApp] worker eval", SETUP_WASM_PLOT_CACHE_R);
-  await postToRWorker(worker, {
-    type: RWASM.EVAL,
-    code: SETUP_WASM_PLOT_CACHE_R,
-  });
 
   console.info("[runApp] worker eval", RUN_WEB_APP_R);
   await postToRWorker(worker, {

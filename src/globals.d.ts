@@ -1,10 +1,13 @@
 export {};
 
 declare global {
-  /**
-   * The Emscripten R.wasm module object. It is created and populated by the
-   * generated glue code, so it is intentionally loosely typed here.
-   */
+  /** Live Rmain instance (set by Lucent after init) for the httpuv bridge. */
   // eslint-disable-next-line no-var
-  var Module: any;
+  var Module:
+    | {
+        httpuv?: unknown;
+        _rWasmEvalDepth?: number;
+        [key: string]: unknown;
+      }
+    | undefined;
 }
