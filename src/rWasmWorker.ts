@@ -240,6 +240,25 @@ function formatRWasmError(err: unknown): string {
   return String(err);
 }
 
+function replyOk(id: unknown): void {
+  if (id == null) {
+    return;
+  }
+  postToHost({ type: RWASM.EVAL_RESULT, id, ok: true });
+}
+
+function replyErr(id: unknown, err: unknown): void {
+  if (id == null) {
+    return;
+  }
+  postToHost({
+    type: RWASM.EVAL_RESULT,
+    id,
+    ok: false,
+    error: formatRWasmError(err),
+  });
+}
+
 function scheduleRDrain(): void {
   if (rDrainScheduled) {
     return;
@@ -615,17 +634,16 @@ function installBridge(t: HttpuvTransport): void {
 async function initEverything(): Promise<RModule> {
   transport = await loadTransport(config.transportBaseUrl);
   HTTP_IDLE_MAX_MS = transport.REQUEST_TIMEOUT_MS;
-  installBridge(transport);
   const assetBaseUrl = new URL(config.rRuntimeBaseUrl, self.location.href).href;
   rAssetBaseUrl = assetBaseUrl;
   const module = await initRModule({
     assetBaseUrl,
     hostPrefixDir: config.hostPrefixDir,
-    httpuv: (globalThis.Module as { httpuv?: unknown } | undefined)?.httpuv,
     print: (text) => log("log", text),
     printErr: (text) => log("error", text),
   });
   rModule = module;
+  installBridge(transport);
   ensureRLaterPump();
   return module;
 }
@@ -761,14 +779,9 @@ async function onMessage(event: MessageEvent): Promise<void> {
         const module = await ensureRModule();
         const files = Array.isArray(data.files) ? (data.files as WebAppFile[]) : [];
         writeWebAppFilesToVfs(module, files);
-        postToHost({ type: RWASM.EVAL_RESULT, id: data.id, ok: true });
+        replyOk(data.id);
       } catch (err) {
-        postToHost({
-          type: RWASM.EVAL_RESULT,
-          id: data.id,
-          ok: false,
-          error: err instanceof Error ? err.message : String(err),
-        });
+        replyErr(data.id, err);
       }
       break;
     }
@@ -779,20 +792,12 @@ async function onMessage(event: MessageEvent): Promise<void> {
         await enqueueRTask(() => {
           evalR(module, String(data.code ?? ""));
         });
-        if (data.id != null) {
-          postToHost({ type: RWASM.EVAL_RESULT, id: data.id, ok: true });
-        }
+        replyOk(data.id);
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
         if (data.id != null) {
-          postToHost({
-            type: RWASM.EVAL_RESULT,
-            id: data.id,
-            ok: false,
-            error: message,
-          });
+          replyErr(data.id, err);
         } else {
-          log("error", `[rWasmWorker] eval failed: ${message}`);
+          log("error", `[rWasmWorker] eval failed: ${formatRWasmError(err)}`);
         }
       }
       break;
@@ -804,19 +809,10 @@ async function onMessage(event: MessageEvent): Promise<void> {
           throw new Error("R asset base URL is not set");
         }
         await remountRHome(requireRModule(), rAssetBaseUrl, config.hostPrefixDir);
-        if (data.id != null) {
-          postToHost({ type: RWASM.EVAL_RESULT, id: data.id, ok: true });
-        }
+        replyOk(data.id);
       } catch (err) {
         log("error", `[rWasmWorker] remount R_HOME failed: ${formatRWasmError(err)}`);
-        if (data.id != null) {
-          postToHost({
-            type: RWASM.EVAL_RESULT,
-            id: data.id,
-            ok: false,
-            error: formatRWasmError(err),
-          });
-        }
+        replyErr(data.id, err);
       }
       break;
     }

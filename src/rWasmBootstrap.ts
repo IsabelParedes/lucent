@@ -27,7 +27,6 @@ export interface InitRModuleOptions {
   assetBaseUrl: string;
   /** Host directory name under assetBaseUrl for the wasm prefix tree. */
   hostPrefixDir?: string;
-  httpuv?: unknown;
   print?: (text: string) => void;
   printErr?: (text: string) => void;
 }
@@ -221,22 +220,6 @@ export async function remountRHome(
     }
   }
 }, error = function(e) NULL)`);
-  evalR(Module, `tryCatch({
-  suppressPackageStartupMessages(library(shiny))
-  drawBody <- deparse(body(getFromNamespace("drawPlot", "shiny")))
-  resizeBody <- deparse(body(getFromNamespace("resizeSavedPlot", "shiny")))
-  publishBody <- deparse(body(getFromNamespace("plotPublishPng", "shiny")))
-  fileUrlBody <- deparse(body(ShinySession$public_methods$fileUrl))
-  ok <- all(
-    any(grepl("plotPublishPng", drawBody)),
-    any(grepl("plotImgHasSrc", resizeBody)),
-    any(grepl("wasmPublishFileUrl", publishBody)),
-    any(grepl("wasmPublishFileUrl", fileUrlBody))
-  )
-  cat("[rWasm] shiny wasm plot patch:", ok, "\\n")
-}, error = function(e) {
-  cat("[rWasm] shiny reload check failed:", conditionMessage(e), "\\n")
-})`);
   console.info("[rWasm] Remounted prefix from", assetBaseUrl);
 }
 
@@ -282,32 +265,19 @@ export function writeWebAppFilesToVfs(Module: RModule, files: WebAppFile[]): voi
 export async function initRModule({
   assetBaseUrl,
   hostPrefixDir,
-  httpuv,
   print,
   printErr,
 }: InitRModuleOptions): Promise<RModule> {
   const prefix = resolveHostPrefixDir(hostPrefixDir);
   const fileCache = await mountRHome(assetBaseUrl, prefix);
   const locateFile = createLocateFile(assetBaseUrl, prefix);
-  const { wasm: wasmUrl } = createAssetUrls(assetBaseUrl, prefix);
-
-  const [createRmain, wasmBinary] = await Promise.all([
-    loadRmainFactory(assetBaseUrl, prefix),
-    fetch(wasmUrl).then((res) => {
-      if (!res.ok) {
-        throw new Error(`Failed to fetch ${wasmUrl.href}: HTTP ${res.status}`);
-      }
-      return res.arrayBuffer();
-    }),
-  ]);
+  const createRmain = await loadRmainFactory(assetBaseUrl, prefix);
 
   // Same object is mutated by Emscripten; preRun closes over it for FS writes.
   const module = {
     noInitialRun: true,
     _rWasmEvalDepth: 0,
-    wasmBinary,
     locateFile,
-    httpuv: httpuv ?? globalThis.Module?.httpuv,
     preRun: [
       () => {
         writeCachedTree(module, fileCache);
