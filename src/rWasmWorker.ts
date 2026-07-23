@@ -26,6 +26,9 @@ const workerSelf = self as unknown as DedicatedWorkerGlobalScope;
 const config = resolveLucentConfig();
 
 let rAssetBaseUrl: string | null = null;
+/** Last successfully mounted prefix identity (skip remount when unchanged). */
+let mountedAssetBaseUrl: string | null = null;
+let mountedHostPrefixDir: string | null = null;
 let transport: HttpuvTransport | null = null;
 let rModule: RModule | null = null;
 let rModulePromise: Promise<RModule> | null = null;
@@ -265,6 +268,8 @@ async function initEverything(): Promise<RModule> {
     printErr: (text) => log("error", text),
   });
   rModule = module;
+  mountedAssetBaseUrl = assetBaseUrl;
+  mountedHostPrefixDir = config.hostPrefixDir;
   installBridge(transport);
   pump.ensureRLaterPump();
   return module;
@@ -429,10 +434,24 @@ async function onMessage(event: MessageEvent): Promise<void> {
 
     case RWASM.REMOUNT_R_HOME: {
       try {
+        await ensureRModule();
         if (!rAssetBaseUrl) {
           throw new Error("R asset base URL is not set");
         }
-        await remountRHome(requireRModule(), rAssetBaseUrl, config.hostPrefixDir);
+        const force = Boolean(data.force);
+        const prefix = config.hostPrefixDir;
+        if (
+          !force &&
+          mountedAssetBaseUrl === rAssetBaseUrl &&
+          mountedHostPrefixDir === prefix
+        ) {
+          console.info("[rWasmWorker] remount skipped (prefix unchanged)");
+          replyOk(data.id);
+          break;
+        }
+        await remountRHome(requireRModule(), rAssetBaseUrl, prefix);
+        mountedAssetBaseUrl = rAssetBaseUrl;
+        mountedHostPrefixDir = prefix;
         replyOk(data.id);
       } catch (err) {
         log("error", `[rWasmWorker] remount R_HOME failed: ${formatRWasmError(err)}`);

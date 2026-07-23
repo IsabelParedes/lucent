@@ -516,7 +516,12 @@ export async function runApp(files: AppFile[]): Promise<number> {
 
   clearAppDocumentCache();
   await postToRWorker(worker, { type: RWASM.STOP_APP });
-  await postToRWorker(worker, { type: RWASM.REMOUNT_R_HOME });
+
+  // Remount only when forced (?remountRHome=1) or when the worker detects that
+  // rRuntimeBaseUrl / hostPrefixDir changed since the last mount.
+  const forceRemount =
+    new URLSearchParams(self.location.search).get("remountRHome") === "1";
+  await postToRWorker(worker, { type: RWASM.REMOUNT_R_HOME, force: forceRemount });
 
   const transfer = files.map((f) => f.data.buffer as ArrayBuffer);
   await postToRWorker(worker, { type: RWASM.WRITE_WEB_APP_FILES, files }, transfer);
