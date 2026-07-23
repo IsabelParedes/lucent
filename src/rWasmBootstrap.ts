@@ -1,4 +1,7 @@
-import { injectRWasmEvalGlue } from "./rWasmEval";
+import type { RMainModule } from "./rWasmEval";
+
+/** Emscripten MODULARIZE factory exported as EXPORT_NAME=Rmain. */
+type RmainFactory = (config: Record<string, unknown>) => Promise<RModule>;
 
 /** Minimal view of the Emscripten in-memory filesystem used by the bootstrap. */
 export interface EmscriptenFS {
@@ -10,12 +13,9 @@ export interface EmscriptenFS {
   analyzePath(path: string): { exists: boolean };
 }
 
-/** Minimal view of the initialized R.wasm module. */
-export interface RModule {
+/** Minimal view of the initialized Rmain module. */
+export interface RModule extends RMainModule {
   FS: EmscriptenFS;
-  evalR: (code: string) => unknown;
-  initR: (args: string[]) => number;
-  callMain: (args: string[]) => number;
   _rWasmEvalDepth: number;
   [key: string]: unknown;
 }
@@ -45,16 +45,6 @@ export const WEB_APP_R = `${WEB_APP_DIR}/app.R`;
 
 const VFS_SKIP = new Set([`${WASM_R_HOME}/etc/ldpaths`, `${WASM_R_HOME}/etc/Makeconf`]);
 
-export function rEnv(): Record<string, string> {
-  return {
-    R_HOME: WASM_R_HOME,
-    R_LIBS: `${WASM_R_HOME}/library`,
-    R_LIBS_USER: "NULL",
-    R_LIBS_SITE: "NULL",
-    LD_LIBRARY_PATH: `${WASM_R_HOME}/lib:/lib`,
-  };
-}
-
 interface AssetUrls {
   glue: URL;
   wasm: URL;
@@ -69,8 +59,8 @@ export function createAssetUrls(baseUrl: string): AssetUrls {
   const base = new URL(baseUrl, self.location.href);
   const hostPrefix = hostPrefixBase(baseUrl);
   return {
-    glue: new URL("lib/R/bin/exec/R", hostPrefix),
-    wasm: new URL("lib/R/bin/exec/R.wasm", hostPrefix),
+    glue: new URL("bin/Rmain", hostPrefix),
+    wasm: new URL("bin/Rmain.wasm", hostPrefix),
     manifest: new URL("_env-wasm-manifest.json", base),
   };
 }
@@ -80,7 +70,7 @@ export function createLocateFile(baseUrl: string): (file: string) => string {
   return function locateFile(file: string): string {
     const fileBase = file.split("/").pop() ?? file;
     if (fileBase.endsWith(".wasm")) {
-      return new URL("lib/R/bin/exec/R.wasm", hostPrefix).href;
+      return new URL("bin/Rmain.wasm", hostPrefix).href;
     }
     const pkgMatch = file.match(/\/library\/([^/]+)\/libs\/([^/]+)$/);
     if (pkgMatch) {
@@ -171,33 +161,26 @@ export function verifyMountedTree(module: RModule): void {
   }
 }
 
-async function loadGlue(baseUrl: string): Promise<string> {
+/** Fetch Rmain glue and return the MODULARIZE factory (`EXPORT_NAME=Rmain`). */
+async function loadRmainFactory(baseUrl: string): Promise<RmainFactory> {
   const { glue: glueUrl } = createAssetUrls(baseUrl);
-  let glue = await fetch(glueUrl).then((res) => {
+  const src = await fetch(glueUrl).then((res) => {
     if (!res.ok) {
       throw new Error(`Failed to fetch ${glueUrl.href}: HTTP ${res.status}`);
     }
     return res.text();
   });
-
-  const env = rEnv();
-  const envLiteral = JSON.stringify(env);
-  glue = glue.replace("var ENV={};", `var ENV=${envLiteral};`);
-  glue = glue.replace(
-    "var Module=typeof Module!=\"undefined\"?Module:{};",
-    "var Module=globalThis.Module;",
-  );
-  glue = glue.replace(
-    'env={USER:"web_user",LOGNAME:"web_user",PATH:"/",PWD:"/",HOME:"/home/web_user",LANG:lang,_:getExecutableName()};',
-    `env={R_HOME:"${env.R_HOME}",R_LIBS:"${env.R_LIBS}",R_LIBS_USER:"${env.R_LIBS_USER}",R_LIBS_SITE:"${env.R_LIBS_SITE}",LD_LIBRARY_PATH:"${env.LD_LIBRARY_PATH}",USER:"web_user",LOGNAME:"web_user",PATH:"/",PWD:"/",HOME:"/home/web_user",LANG:lang,_:getExecutableName()};`,
-  );
-  glue = injectRWasmEvalGlue(glue);
-  return glue;
+  // Evaluate in a function scope so `var Rmain = ...` does not need globalThis.
+  const factory = new Function(`${src}\nreturn Rmain;`)() as RmainFactory;
+  if (typeof factory !== "function") {
+    throw new Error("Rmain factory missing; rebuild r-main with -sMODULARIZE=1 -sEXPORT_NAME=Rmain");
+  }
+  return factory;
 }
 
 export function evalR(Module: RModule, code: string): unknown {
   if (typeof Module.evalR !== "function") {
-    throw new Error("Module.evalR is missing; check rWasmEval.ts glue patch");
+    throw new Error("Module.evalR is missing; Rmain was not built with rmain_post.js");
   }
   if (Module._rWasmEvalDepth > 0) {
     throw new Error("reentrant evalR");
@@ -290,7 +273,8 @@ export function writeWebAppFilesToVfs(Module: RModule, files: WebAppFile[]): voi
 }
 
 /**
- * Load and initialize R.wasm in the current global scope (main thread or worker).
+ * Load and initialize Rmain (main thread or worker) via the MODULARIZE factory.
+ * Keeps globalThis.Module in sync for the httpuv bridge.
  */
 export async function initRModule({
   assetBaseUrl,
@@ -299,12 +283,11 @@ export async function initRModule({
   printErr,
 }: InitRModuleOptions): Promise<RModule> {
   const fileCache = await mountRHome(assetBaseUrl);
-  const env = rEnv();
   const locateFile = createLocateFile(assetBaseUrl);
   const { wasm: wasmUrl } = createAssetUrls(assetBaseUrl);
 
-  const [glue, wasmBinary] = await Promise.all([
-    loadGlue(assetBaseUrl),
+  const [createRmain, wasmBinary] = await Promise.all([
+    loadRmainFactory(assetBaseUrl),
     fetch(wasmUrl).then((res) => {
       if (!res.ok) {
         throw new Error(`Failed to fetch ${wasmUrl.href}: HTTP ${res.status}`);
@@ -313,42 +296,37 @@ export async function initRModule({
     }),
   ]);
 
-  return new Promise<RModule>((resolve, reject) => {
-    globalThis.Module = {
-      noInitialRun: true,
-      _rWasmEvalDepth: 0,
-      wasmBinary,
-      locateFile,
-      ENV: env,
-      httpuv: httpuv ?? globalThis.Module?.httpuv,
-      preRun: [() => writeCachedTree(globalThis.Module as RModule, fileCache)],
-      onRuntimeInitialized() {
-        const module = globalThis.Module as RModule;
-        writeCachedTree(module, fileCache);
-        mountRHomeLibToSlashLib(module, fileCache);
-        try {
-          verifyMountedTree(module);
-        } catch (err) {
-          reject(err);
-          return;
-        }
-        bootstrapRSession(module).then(() => resolve(module)).catch(reject);
-      },
-      onAbort(reason: unknown) {
-        reject(new Error(`R.wasm aborted: ${String(reason)}`));
-      },
-      print(text: unknown) {
-        (print ?? console.log)(String(text));
-      },
-      printErr(text: unknown) {
-        (printErr ?? console.error)(String(text));
-      },
-    };
+  // Same object is mutated by Emscripten; preRun closes over it for FS writes.
+  const module = {
+    noInitialRun: true,
+    _rWasmEvalDepth: 0,
+    wasmBinary,
+    locateFile,
+    httpuv: httpuv ?? globalThis.Module?.httpuv,
+    preRun: [() => writeCachedTree(module, fileCache)],
+    onAbort(reason: unknown) {
+      throw new Error(`Rmain aborted: ${String(reason)}`);
+    },
+    print(text: unknown) {
+      (print ?? console.log)(String(text));
+    },
+    printErr(text: unknown) {
+      (printErr ?? console.error)(String(text));
+    },
+  } as unknown as RModule;
 
-    try {
-      globalThis.eval(glue);
-    } catch (err) {
-      reject(err);
-    }
-  });
+  try {
+    await createRmain(module);
+  } catch (err) {
+    throw err instanceof Error ? err : new Error(String(err));
+  }
+
+  writeCachedTree(module, fileCache);
+  mountRHomeLibToSlashLib(module, fileCache);
+  verifyMountedTree(module);
+  await bootstrapRSession(module);
+
+  // httpuv bridge reads Module.httpuv / Module._rWasmEvalDepth from globalThis.
+  globalThis.Module = module;
+  return module;
 }
