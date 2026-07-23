@@ -54,13 +54,19 @@ function appUrl(subpath = ""): string {
 }
 
 function serviceWorkerScriptUrl(): URL {
-  const base = new URL(config.transportBaseUrl, self.location.href);
-  const url = new URL("httpuv-sw.js", base);
+  const url = new URL(config.serviceWorkerUrl, self.location.href);
   // Tell the SW its mount prefix up-front so it intercepts correctly before the
   // REGISTER_HOST message arrives (avoids a first-load race on asset requests).
   url.searchParams.set("shinyPrefix", shinyPrefix());
   url.searchParams.set("hostPrefix", config.hostPrefixDir);
   return url;
+}
+
+/** Max default scope for the SW script (its directory). Avoid forcing `/` so
+ * project GitHub Pages mounts (`/repo/httpuv-sw.js` → scope `/repo/`) work
+ * without `Service-Worker-Allowed`. */
+function serviceWorkerScope(): string {
+  return new URL("./", serviceWorkerScriptUrl()).pathname;
 }
 
 function announceHostToServiceWorker(): boolean {
@@ -200,7 +206,7 @@ async function registerHttpuvServiceWorker(): Promise<ServiceWorkerRegistration 
     await cleanupStaleHttpuvServiceWorkers();
 
     const reg = await navigator.serviceWorker.register(serviceWorkerScriptUrl(), {
-      scope: "/",
+      scope: serviceWorkerScope(),
       updateViaCache: "none",
     });
     await waitForServiceWorkerInstall(reg);
@@ -299,6 +305,7 @@ function workerConfigParam(): string {
   const abs = (u?: string): string | undefined => (u == null ? undefined : new URL(u, base).href);
   const payload: Partial<LucentConfig> = {
     transportBaseUrl: abs(config.transportBaseUrl),
+    serviceWorkerUrl: abs(config.serviceWorkerUrl),
     rRuntimeBaseUrl: abs(config.rRuntimeBaseUrl),
     hostPrefixDir: config.hostPrefixDir,
     shinyBaseUrl: abs(config.shinyBaseUrl),

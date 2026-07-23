@@ -1,8 +1,15 @@
 import { HOST_PREFIX, WASM_R_HOME } from "./rwasm-constants";
 
 export interface LucentConfig {
-  /** Base URL where the r-httpuv transport assets (httpuv-web.js, httpuv-sw.js, ...) are served. */
+  /** Base URL where the r-httpuv transport assets (httpuv-web.js, shiny-socket.js, ...) are served. */
   transportBaseUrl: string;
+  /**
+   * URL of the httpuv service worker script. Defaults to `/httpuv-sw.js` at the
+   * site root so registration works on hosts that cannot send
+   * `Service-Worker-Allowed` (e.g. GitHub Pages). The canonical copy still
+   * lives under the wasm prefix; the root file is a deploy-time/serve alias.
+   */
+  serviceWorkerUrl: string;
   /** Base URL of the site root (_env-wasm-manifest.json and host prefix tree). */
   rRuntimeBaseUrl: string;
   /** Host directory name under rRuntimeBaseUrl where the wasm prefix tree is served. */
@@ -25,6 +32,9 @@ export const DEFAULT_HOST_PREFIX_DIR = HOST_PREFIX;
 
 /** Default location of r-httpuv transport assets inside the wasm prefix. */
 export const DEFAULT_TRANSPORT_BASE_URL = `/${HOST_PREFIX}${WASM_R_HOME}/library/httpuv/www/`;
+
+/** Default SW script URL (site root; see LucentConfig.serviceWorkerUrl). */
+export const DEFAULT_SERVICE_WORKER_URL = "/httpuv-sw.js";
 
 /** Default site root for the wasm prefix manifest and host tree. */
 export const DEFAULT_R_RUNTIME_BASE_URL = "/";
@@ -77,6 +87,7 @@ export function resolveLucentConfig(overrides: Partial<LucentConfig> = {}): Luce
     overrides[key] ?? fromUrl[key] ?? fromGlobal[key];
   return {
     transportBaseUrl: pick("transportBaseUrl") ?? DEFAULT_TRANSPORT_BASE_URL,
+    serviceWorkerUrl: pick("serviceWorkerUrl") ?? DEFAULT_SERVICE_WORKER_URL,
     rRuntimeBaseUrl: pick("rRuntimeBaseUrl") ?? DEFAULT_R_RUNTIME_BASE_URL,
     hostPrefixDir: pick("hostPrefixDir") ?? DEFAULT_HOST_PREFIX_DIR,
     shinyBaseUrl: pick("shinyBaseUrl") ?? DEFAULT_SHINY_BASE_URL,
