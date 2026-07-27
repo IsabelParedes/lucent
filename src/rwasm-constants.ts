@@ -22,4 +22,12 @@ export const RWASM = {
   RESOURCE_PATHS: "rwasm_resource_paths",
   LOG: "rwasm_log",
   ERROR: "rwasm_error",
+  /** Main → worker: run one shiny::serviceOnce tick. */
+  SERVICE_TICK: "rwasm_service_tick",
+  /** Worker → main: result of a SERVICE_TICK (`hadWork` continues rAF). */
+  SERVICE_STATUS: "rwasm_service_status",
+  /** Worker → main: schedule an immediate rAF wake. */
+  NEED_SERVICE: "rwasm_need_service",
+  /** Worker → main: delayed wake (`delayMs`) via setTimeout then rAF. */
+  SCHEDULE_DELAY: "rwasm_schedule_delay",
 } as const;

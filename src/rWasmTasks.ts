@@ -11,6 +11,47 @@ export const SHINY_HOST = {
   suspend: `tryCatch(shiny::suspendServiceLoop(), error=function(e) NULL)`,
   resume: `tryCatch(shiny::resumeServiceLoop(), error=function(e) NULL)`,
   serviceOnce: `tryCatch(shiny::serviceOnce(), error=function(e) NULL)`,
+  /**
+   * Run serviceOnce and write status JSON to a VFS flag file.
+   * Module.evalR returns an SEXP pointer, not the R value — callers must read
+   * the flag file to learn hadWork.
+   */
+  serviceOnceHadWork: `tryCatch({
+  had <- isTRUE(shiny::serviceOnce())
+  next_ms <- tryCatch(shiny:::timerCallbacks$timeToNextEvent(), error=function(e) NA_real_)
+  running <- tryCatch(shiny::isRunning(), error=function(e) FALSE)
+  # Compact session/output diag for empty-output debugging (tabset suspend, busyCount).
+  outs <- list()
+  tryCatch({
+    sessions <- shiny:::appsByToken$values()
+    for (s in sessions) {
+      priv <- s$.__enclos_env__$private
+      onames <- names(priv$.outputs)
+      for (nm in onames) {
+        obs <- priv$.outputs[[nm]]
+        hidden <- priv$.clientData$.values$get(paste0("output_", nm, "_hidden"))
+        outs[[length(outs) + 1L]] <- list(
+          name = nm,
+          suspended = isTRUE(obs$.suspended),
+          hidden = if (is.null(hidden)) "NULL" else isTRUE(hidden),
+          busy = as.integer(priv$busyCount)
+        )
+      }
+    }
+  }, error = function(e) {
+    outs <<- list(list(err = conditionMessage(e)))
+  })
+  jsonlite::write_json(list(
+    had = isTRUE(had),
+    nextMs = if (is.finite(next_ms)) next_ms else -1,
+    running = isTRUE(running),
+    outs = outs
+  ), "/tmp/lucent-service-had-work", auto_unbox=TRUE)
+  invisible(had)
+}, error=function(e) {
+  tryCatch(jsonlite::write_json(list(had=FALSE, err=conditionMessage(e)), "/tmp/lucent-service-had-work", auto_unbox=TRUE), error=function(e2) NULL)
+  invisible(FALSE)
+})`,
 } as const;
 
 export type TaskRuntime = {
@@ -27,7 +68,7 @@ interface RTask {
 export type RTaskQueue = {
   scheduleMacrotask: (cb: () => void) => void;
   enqueueRTask: (work: () => void) => Promise<void>;
-  evalRNow: (code: string) => void;
+  evalRNow: (code: string) => unknown;
   isRLocked: () => boolean;
   hasPendingRTasks: () => boolean;
 };
@@ -96,12 +137,12 @@ export function createRTaskQueue(rt: TaskRuntime): RTaskQueue {
     });
   }
 
-  function evalRNow(code: string): void {
+  function evalRNow(code: string): unknown {
     const module = rt.getModule();
     if (!module) {
       throw new Error("[lucent] R module not initialized yet");
     }
-    evalR(module, code);
+    return evalR(module, code);
   }
 
   return {

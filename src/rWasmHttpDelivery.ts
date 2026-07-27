@@ -22,7 +22,8 @@ export type HttpDeliveryDeps = {
   tasks: RTaskQueue;
   getModule: () => RModule | null;
   requireTransport: () => HttpuvTransport;
-  markActivity: () => void;
+  /** Wake the main-thread rAF service driver. */
+  requestService: () => void;
   dbg: (stage: string, ...args: unknown[]) => void;
   formatError: (err: unknown) => string;
   logError: (err: unknown, url?: string) => void;
@@ -155,11 +156,13 @@ export function createHttpDelivery(deps: HttpDeliveryDeps): HttpDelivery {
       if (!staticAsset) {
         await idleWaitForHttpResponse(state, uuid, httpIdleMaxMs);
 
+        // Only force serviceOnce drains when the HTTP response never arrived.
+        // Session open/send already returns 204; reactive flush is owned by the
+        // main-thread rAF driver via requestService() after inflight clears.
         if (!state.resolved) {
           await drainAfterHttpPush(HTTP_PUSH_DRAIN_ROUNDS, uuid, state);
         } else if (sessionHttp) {
-          deps.dbg("worker-session-drain", { uuid });
-          await drainAfterHttpPush(HTTP_PUSH_DRAIN_ROUNDS, uuid, { resolved: false });
+          deps.dbg("worker-session-skip-drain", { uuid });
         }
       } else if (!state.resolved) {
         await yieldMs(HTTP_DRAIN_YIELD_MS);
@@ -170,6 +173,10 @@ export function createHttpDelivery(deps: HttpDeliveryDeps): HttpDelivery {
         activeHttpDrainUuid = null;
       }
       httpDeliveryInflight--;
+      // Host rAF continues reactive work after session open/send completes.
+      if (sessionHttp) {
+        deps.requestService();
+      }
     }
   }
 
@@ -217,7 +224,7 @@ export function createHttpDelivery(deps: HttpDeliveryDeps): HttpDelivery {
   }
 
   function enqueueHttpDelivery(req: HostInboundMessage): Promise<void> {
-    deps.markActivity();
+    deps.requestService();
     deps.dbg("worker-push", { uuid: req.uuid, method: req.method, url: req.url });
 
     return new Promise((resolve, reject) => {

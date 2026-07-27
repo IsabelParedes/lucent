@@ -10,8 +10,7 @@ import {
   type RModule,
   type WebAppFile,
 } from "./rWasmBootstrap";
-import { createHttpDelivery, type HttpDelivery } from "./rWasmHttpDelivery";
-import { createLaterPump } from "./rWasmPump";
+import { createHttpDelivery } from "./rWasmHttpDelivery";
 import { createRTaskQueue, SHINY_HOST } from "./rWasmTasks";
 import { RWASM } from "./rwasm-constants";
 import {
@@ -41,27 +40,14 @@ const tasks = createRTaskQueue({
   getTransport: () => transport,
 });
 
-const httpRef: { current: HttpDelivery | null } = { current: null };
+function postToHost(payload: unknown, transfer: Transferable[] = []): void {
+  workerSelf.postMessage(payload, transfer);
+}
 
-const pump = createLaterPump({
-  tasks,
-  getModule: () => rModule,
-  isHttpDeliveryActive: () => httpRef.current?.isHttpDeliveryActive() ?? false,
-  hasHttpWork: () => httpRef.current?.hasHttpWork() ?? false,
-  formatError: formatRWasmError,
-  dbg,
-});
-
-const http = createHttpDelivery({
-  tasks,
-  getModule: () => rModule,
-  requireTransport,
-  markActivity: () => pump.markActivity(),
-  dbg,
-  formatError: formatRWasmError,
-  logError: logHttpDeliveryError,
-});
-httpRef.current = http;
+/** Ask the main-thread rAF driver for another service tick. */
+function requestService(): void {
+  postToHost({ type: RWASM.NEED_SERVICE });
+}
 
 function requireTransport(): HttpuvTransport {
   if (!transport) {
@@ -81,9 +67,15 @@ function dbg(stage: string, ...args: unknown[]): void {
   transport?.httpuvDebugLog(stage, ...args);
 }
 
-function postToHost(payload: unknown, transfer: Transferable[] = []): void {
-  workerSelf.postMessage(payload, transfer);
-}
+const http = createHttpDelivery({
+  tasks,
+  getModule: () => rModule,
+  requireTransport,
+  requestService,
+  dbg,
+  formatError: formatRWasmError,
+  logError: logHttpDeliveryError,
+});
 
 function log(level: "log" | "error", text: unknown): void {
   const msg = String(text);
@@ -168,7 +160,7 @@ function deliverToServiceWorker(outbound: OutboundMessage, transfer: Transferabl
     console.warn("[rWasmWorker] Service worker delivery API not connected");
     return;
   }
-  pump.markActivity();
+  requestService();
 
   if (outbound.type === t.MSG.HTTP_RESPONSE) {
     dbg("comlink-deliver-http", { uuid: outbound.uuid, status: outbound.status });
@@ -214,11 +206,11 @@ function pushToR(msg: ChannelMessageLike): void {
   if (msg?.uuid) {
     dbg("worker-push-evalR-begin", { uuid: msg.uuid });
   }
-  if (
+  const isWs =
     msg?.type === t.CHANNEL.WS_OPEN ||
     msg?.type === t.CHANNEL.WS_MESSAGE ||
-    msg?.type === t.CHANNEL.WS_CLOSE
-  ) {
+    msg?.type === t.CHANNEL.WS_CLOSE;
+  if (isWs) {
     dbg("worker-push-ws", {
       type: msg.type,
       handle: t.normalizeSessionHandle(msg.handle),
@@ -226,15 +218,57 @@ function pushToR(msg: ChannelMessageLike): void {
       messageLen: messageBodyLength(msg.message),
     });
   }
-  tasks.evalRNow(`tryCatch({
+  let pushOk = false;
+  try {
+    tasks.evalRNow(`tryCatch({
   ${t.channelMessageToRExpr(msg)}
 }, error=function(e) {
   msg <- paste0("[httpuv] push failed (", ${JSON.stringify(String(msg.url ?? ""))}, "): ", conditionMessage(e))
   message(msg)
   stop(msg)
 })`);
-  if (msg?.uuid) {
-    dbg("worker-push-evalR-finish", { uuid: msg.uuid });
+    pushOk = true;
+  } catch (err: unknown) {
+    throw err;
+  } finally {
+    if (msg?.uuid) {
+      dbg("worker-push-evalR-finish", { uuid: msg.uuid, ok: pushOk });
+    }
+    // Flush on the worker task queue immediately — do not wait for main-thread
+    // rAF (Chrome can defer parent-page rAF while the Shiny iframe has focus).
+    // Always enqueue even if push threw so pending observers/promises can drain.
+    void tasks
+      .enqueueRTask(() => {
+        if (!rModule) {
+          return;
+        }
+        tasks.evalRNow(SHINY_HOST.serviceOnceHadWork);
+      })
+      .catch((err: unknown) => {
+        const error = formatRWasmError(err);
+        // JS stack overflows bypass R tryCatch/finally, leaving session busyCount
+        // stuck at 1 so later input/hidden updates never run. Force-decrement.
+        if (/Maximum call stack size exceeded/i.test(error) && rModule) {
+          try {
+            // Only clear stuck busyCount. Do NOT send fake "recalculated" for
+            // every output — that breaks clients still in 'invalidated'.
+            tasks.evalRNow(`tryCatch({
+  for (s in shiny:::appsByToken$values()) {
+    priv <- s$.__enclos_env__$private
+    while (isTRUE(priv$busyCount > 0L)) {
+      s$decrementBusyCount()
+    }
+  }
+  invisible(NULL)
+}, error=function(e) NULL)`);
+          } catch {
+            // ignore recovery failures
+          }
+        }
+        console.warn("[rWasmWorker] post-push serviceOnce failed:", error);
+      });
+    // Also wake the host driver for any follow-up deferred timers.
+    requestService();
   }
 }
 
@@ -252,6 +286,15 @@ function installBridge(t: HttpuvTransport): void {
     postOutbound: deliverToServiceWorker,
     pushToR: (msg) => {
       pushToR(msg);
+    },
+    requestHostService: () => {
+      requestService();
+    },
+    scheduleHostDelay: (delayMs) => {
+      postToHost({
+        type: RWASM.SCHEDULE_DELAY,
+        delayMs: Math.max(0, Number(delayMs) || 0),
+      });
     },
   });
 }
@@ -271,7 +314,6 @@ async function initEverything(): Promise<RModule> {
   mountedAssetBaseUrl = assetBaseUrl;
   mountedHostPrefixDir = config.hostPrefixDir;
   installBridge(transport);
-  pump.ensureRLaterPump();
   return module;
 }
 
@@ -292,7 +334,11 @@ function readVfsFile(vfsDir: string, suffix: string): Promise<ArrayBuffer | null
     const path = `${vfsDir.replace(/\/$/, "")}/${rel}`;
     try {
       const data = module.FS.readFile(path, { encoding: "binary" });
-      return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+      const buf = data.buffer.slice(
+        data.byteOffset,
+        data.byteOffset + data.byteLength,
+      ) as ArrayBuffer;
+      return buf;
     } catch (err) {
       log("error", `[rWasmWorker] readVfsFile failed ${path}: ${formatRWasmError(err)}`);
       return null;
@@ -400,8 +446,6 @@ async function onMessage(event: MessageEvent): Promise<void> {
     return;
   }
 
-  pump.markActivity();
-
   switch (data.type) {
     case RWASM.WRITE_WEB_APP_FILES: {
       try {
@@ -422,6 +466,7 @@ async function onMessage(event: MessageEvent): Promise<void> {
           evalR(module, String(data.code ?? ""));
         });
         replyOk(data.id);
+        requestService();
       } catch (err) {
         if (data.id != null) {
           replyErr(data.id, err);
@@ -468,6 +513,41 @@ async function onMessage(event: MessageEvent): Promise<void> {
         }
       } catch (err) {
         log("error", `[rWasmWorker] stop failed: ${formatRWasmError(err)}`);
+      }
+      break;
+    }
+
+    case RWASM.SERVICE_TICK: {
+      try {
+        await ensureRModule();
+        let hadWork = false;
+        let status: Record<string, unknown> = {};
+        await tasks.enqueueRTask(() => {
+          if (!rModule) {
+            return;
+          }
+          tasks.evalRNow(SHINY_HOST.serviceOnceHadWork);
+          // evalR returns an SEXP pointer — read JSON status from the flag file.
+          try {
+            const raw = rModule.FS.readFile("/tmp/lucent-service-had-work", {
+              encoding: "utf8",
+            }).trim();
+            if (raw === "1" || raw === "0") {
+              hadWork = raw === "1";
+              status = { had: hadWork, legacy: true };
+            } else {
+              status = JSON.parse(raw) as Record<string, unknown>;
+              hadWork = Boolean(status.had);
+            }
+          } catch {
+            hadWork = false;
+            status = { parseError: true };
+          }
+        });
+        postToHost({ type: RWASM.SERVICE_STATUS, hadWork });
+      } catch (err) {
+        log("error", `[rWasmWorker] service tick failed: ${formatRWasmError(err)}`);
+        postToHost({ type: RWASM.SERVICE_STATUS, hadWork: false });
       }
       break;
     }

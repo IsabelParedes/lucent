@@ -1,9 +1,15 @@
 import { LUCENT_CONFIG_PARAM, resolveLucentConfig, type LucentConfig } from "./config";
 import { RWASM } from "./rwasm-constants";
+import { createServiceDriver, type ServiceDriver } from "./rWasmServiceDriver";
 import { loadTransport, type HttpuvTransport } from "./transport";
 import { connectHttpuvComlink } from "./wiring";
 
-const RUN_WEB_APP_R = `shiny::startApp(appDir = "webApp", port = 3838L, host = "127.0.0.1", launch.browser = FALSE, quiet = TRUE)`;
+const RUN_WEB_APP_R = `
+local({
+  loadNamespace("shiny")
+  shiny::startApp(appDir = "webApp", port = 3838L, host = "127.0.0.1", launch.browser = FALSE, quiet = TRUE)
+})
+`;
 
 const config: LucentConfig = resolveLucentConfig();
 
@@ -15,6 +21,7 @@ let comlinkPromise: Promise<void> | null = null;
 let swRegistrationPromise: Promise<ServiceWorkerRegistration | null> | null = null;
 let httpuvReadyPromise: Promise<void> | null = null;
 let evalSeq = 0;
+let serviceDriver: ServiceDriver | null = null;
 
 const HTTPUV_SW_RELOAD_KEY = "httpuv-sw-reload";
 
@@ -27,6 +34,8 @@ interface RWorkerMessage {
   error?: string;
   message?: string;
   paths?: Record<string, string>;
+  hadWork?: boolean;
+  delayMs?: number;
 }
 
 function requireTransport(): HttpuvTransport {
@@ -361,6 +370,10 @@ async function ensureRWorker(): Promise<Worker> {
   if (!rWorkerPromise) {
     rWorkerPromise = createRWorker().then((worker) => {
       rWorker = worker;
+      if (!serviceDriver) {
+        serviceDriver = createServiceDriver();
+      }
+      serviceDriver.attach(worker);
       return worker;
     });
   }
@@ -406,6 +419,8 @@ export async function ensureHttpuvReady(): Promise<void> {
 
 function stopRunningApp(): void {
   navigator.serviceWorker.controller?.postMessage({ type: requireTransport().MSG.STOP });
+
+  serviceDriver?.stop();
 
   if (rWorker) {
     rWorker.postMessage({ type: RWASM.STOP_APP });
@@ -538,6 +553,10 @@ export async function runApp(files: AppFile[]): Promise<number> {
     type: RWASM.EVAL,
     code: RUN_WEB_APP_R,
   });
+
+  // Host rAF owns service ticks after startApp; wake once so init/flush can run.
+  serviceDriver?.attach(worker);
+  serviceDriver?.wake();
 
   return 0;
 }

@@ -61,6 +61,8 @@ export interface HttpuvBridgeOptions {
   postOutbound?: (msg: OutboundMessage, transfer?: Transferable[]) => void;
   installSwListener?: boolean;
   pushToR?: (msg: ChannelMessageLike) => void;
+  requestHostService?: () => void;
+  scheduleHostDelay?: (delayMs: number) => void;
 }
 
 /**
