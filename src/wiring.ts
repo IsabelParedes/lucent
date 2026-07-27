@@ -1,3 +1,4 @@
+import { lucentInfo } from "./debug";
 import { RWASM } from "./rwasm-constants";
 
 /** Inbound HTTP request payload the service worker sends over Comlink. */
@@ -66,7 +67,7 @@ export async function connectHttpuvComlink(
   rWorker.postMessage({ type: RWASM.COMLINK_PORT }, [channel.port2]);
 
   await readyPromise;
-  console.info("[lucent] service worker <-> R worker connected (unified port)");
+  lucentInfo("[lucent] service worker <-> R worker connected (unified port)");
 }
 
 function waitForComlinkReady(rWorker: Worker): Promise<void> {

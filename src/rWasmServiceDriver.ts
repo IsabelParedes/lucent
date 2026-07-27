@@ -29,9 +29,8 @@ type ScheduleDelayMessage = {
  * Main-thread Shiny service driver.
  *
  * Visible work is paced with requestAnimationFrame (pauses when the tab is
- * hidden). Delayed wakes use setTimeout then rAF so Chrome does not treat the
- * service loop as a chained timer poll
- * (https://developer.chrome.com/blog/timer-throttling-in-chrome-88/).
+ * hidden). Immediate follow-ups prefer setTimeout(0) so Chrome does not defer
+ * ticks while DevTools is open or focus is inside the Shiny iframe.
  */
 export function createServiceDriver(): ServiceDriver {
   let worker: Worker | null = null;
@@ -39,6 +38,7 @@ export function createServiceDriver(): ServiceDriver {
   let rafId = 0;
   let tickInFlight = false;
   let wakeQueued = false;
+  let soonPending = false;
   let stopped = true;
   const delayTimers = new Set<ReturnType<typeof setTimeout>>();
   /** Absolute deadline (performance.now) of the soonest pending delay, or Infinity. */
@@ -49,6 +49,7 @@ export function createServiceDriver(): ServiceDriver {
       clearTimeout(id);
     }
     delayTimers.clear();
+    soonPending = false;
     delayDeadline = Infinity;
   }
 
@@ -61,10 +62,11 @@ export function createServiceDriver(): ServiceDriver {
   }
 
   function postTick(): void {
-    if (!worker || stopped || tickInFlight) {
-      if (!tickInFlight) {
-        wakeQueued = true;
-      }
+    if (!worker || stopped) {
+      return;
+    }
+    if (tickInFlight) {
+      wakeQueued = true;
       return;
     }
     tickInFlight = true;
@@ -90,6 +92,7 @@ export function createServiceDriver(): ServiceDriver {
       return;
     }
     if (rafPending) {
+      wakeQueued = true;
       return;
     }
     rafPending = true;
@@ -98,8 +101,8 @@ export function createServiceDriver(): ServiceDriver {
 
   /**
    * Immediate wake that does not wait for the next animation frame.
-   * Chrome often defers parent-page rAF while focus is inside the Shiny iframe;
-   * a 0ms timer still runs and is enough to post SERVICE_TICK.
+   * Chrome often defers parent-page rAF while focus is inside the Shiny iframe
+   * or while DevTools is open; a 0ms timer still runs promptly enough.
    */
   function wakeSoon(): void {
     if (stopped || !worker) {
@@ -109,11 +112,23 @@ export function createServiceDriver(): ServiceDriver {
       wakeQueued = true;
       return;
     }
+    if (soonPending) {
+      wakeQueued = true;
+      return;
+    }
+    soonPending = true;
     const id = setTimeout(() => {
       delayTimers.delete(id);
+      soonPending = false;
       postTick();
     }, 0);
     delayTimers.add(id);
+  }
+
+  /** Schedule an immediate service tick; timer first, rAF as backup. */
+  function scheduleFollowUp(): void {
+    wakeSoon();
+    wake();
   }
 
   function scheduleDelay(delayMs: number): void {
@@ -122,7 +137,7 @@ export function createServiceDriver(): ServiceDriver {
     }
     const ms = Math.max(0, Number(delayMs) || 0);
     if (ms <= 0) {
-      wakeSoon();
+      scheduleFollowUp();
       return;
     }
     const deadline = performance.now() + ms;
@@ -135,10 +150,7 @@ export function createServiceDriver(): ServiceDriver {
     const id = setTimeout(() => {
       delayTimers.delete(id);
       delayDeadline = Infinity;
-      // Break the timer chain: fire the actual wake on the next animation frame.
-      requestAnimationFrame(() => {
-        wake();
-      });
+      scheduleFollowUp();
     }, ms);
     delayTimers.add(id);
   }
@@ -160,18 +172,14 @@ export function createServiceDriver(): ServiceDriver {
         return;
       }
       if (hadWork || wakeQueued) {
-        // Immediate follow-up: drop coalesced delays so we don't double-fire.
-        clearDelayTimers();
-        wake();
+        wakeQueued = false;
+        scheduleFollowUp();
       }
       return;
     }
 
     if (data.type === RWASM.NEED_SERVICE) {
-      // Prefer an immediate timer wake so Chrome does not wait on parent rAF
-      // while the viewer iframe holds focus; also arm rAF as a backup pace.
-      wakeSoon();
-      wake();
+      scheduleFollowUp();
       return;
     }
 
@@ -185,7 +193,7 @@ export function createServiceDriver(): ServiceDriver {
       return;
     }
     if (document.visibilityState === "visible") {
-      wake();
+      scheduleFollowUp();
     }
   }
 
@@ -198,7 +206,7 @@ export function createServiceDriver(): ServiceDriver {
     stopped = false;
     worker.addEventListener("message", onWorkerMessage);
     document.addEventListener("visibilitychange", onVisibilityChange);
-    wake();
+    scheduleFollowUp();
   }
 
   function stop(): void {

@@ -19,37 +19,13 @@ export const SHINY_HOST = {
   serviceOnceHadWork: `tryCatch({
   had <- isTRUE(shiny::serviceOnce())
   next_ms <- tryCatch(shiny:::timerCallbacks$timeToNextEvent(), error=function(e) NA_real_)
-  running <- tryCatch(shiny::isRunning(), error=function(e) FALSE)
-  # Compact session/output diag for empty-output debugging (tabset suspend, busyCount).
-  outs <- list()
-  tryCatch({
-    sessions <- shiny:::appsByToken$values()
-    for (s in sessions) {
-      priv <- s$.__enclos_env__$private
-      onames <- names(priv$.outputs)
-      for (nm in onames) {
-        obs <- priv$.outputs[[nm]]
-        hidden <- priv$.clientData$.values$get(paste0("output_", nm, "_hidden"))
-        outs[[length(outs) + 1L]] <- list(
-          name = nm,
-          suspended = isTRUE(obs$.suspended),
-          hidden = if (is.null(hidden)) "NULL" else isTRUE(hidden),
-          busy = as.integer(priv$busyCount)
-        )
-      }
-    }
-  }, error = function(e) {
-    outs <<- list(list(err = conditionMessage(e)))
-  })
   jsonlite::write_json(list(
     had = isTRUE(had),
-    nextMs = if (is.finite(next_ms)) next_ms else -1,
-    running = isTRUE(running),
-    outs = outs
+    nextMs = if (is.finite(next_ms)) next_ms else -1
   ), "/tmp/lucent-service-had-work", auto_unbox=TRUE)
   invisible(had)
 }, error=function(e) {
-  tryCatch(jsonlite::write_json(list(had=FALSE, err=conditionMessage(e)), "/tmp/lucent-service-had-work", auto_unbox=TRUE), error=function(e2) NULL)
+  tryCatch(jsonlite::write_json(list(had=FALSE, nextMs=-1, err=conditionMessage(e)), "/tmp/lucent-service-had-work", auto_unbox=TRUE), error=function(e2) NULL)
   invisible(FALSE)
 })`,
 } as const;

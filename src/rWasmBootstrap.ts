@@ -1,3 +1,4 @@
+import { lucentInfo } from "./debug";
 import { HOST_PREFIX, WASM_R_HOME, WEB_APP_DIR } from "./rwasm-constants";
 
 /** Emscripten MODULARIZE factory exported as EXPORT_NAME=Rmain. */
@@ -146,7 +147,7 @@ export async function mountRHome(
     throw new Error(`Failed to fetch ${manifest.href}: HTTP ${res.status}`);
   }
   const { files } = (await res.json()) as { files: string[] };
-  console.info(
+  lucentInfo(
     "[rWasm] Mounting",
     files.length,
     "files from manifest (concurrency",
@@ -169,7 +170,7 @@ export async function mountRHome(
     }),
   );
 
-  console.info("[rWasm] Cached", fileCache.size, "files");
+  lucentInfo("[rWasm] Cached", fileCache.size, "files");
   return fileCache;
 }
 
@@ -266,7 +267,7 @@ export async function remountRHome(
     }
   }
 }, error = function(e) NULL)`);
-  console.info("[rWasm] Remounted prefix from", assetBaseUrl);
+  lucentInfo("[rWasm] Remounted prefix from", assetBaseUrl);
 }
 
 export async function bootstrapRSession(Module: RModule): Promise<void> {
@@ -277,7 +278,7 @@ export async function bootstrapRSession(Module: RModule): Promise<void> {
 
   evalR(Module, "suppressPackageStartupMessages(library(httpuv))");
   evalR(Module, 'setwd("/")');
-  console.info("[rWasm] R session ready");
+  lucentInfo("[rWasm] R session ready");
 }
 
 /** A single Shiny app file, path relative to the app directory. */
@@ -301,7 +302,7 @@ export function writeWebAppFilesToVfs(Module: RModule, files: WebAppFile[]): voi
     }
     Module.FS.writeFile(dst, file.data);
   }
-  console.info("[rWasm] Wrote", files.length, "webApp file(s) into", WEB_APP_DIR);
+  lucentInfo("[rWasm] Wrote", files.length, "webApp file(s) into", WEB_APP_DIR);
 }
 
 /**

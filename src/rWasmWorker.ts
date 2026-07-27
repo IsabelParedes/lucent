@@ -1,6 +1,7 @@
 import * as Comlink from "comlink";
 
 import { resolveLucentConfig } from "./config";
+import { isLucentDebug, lucentInfo } from "./debug";
 import {
   evalR,
   initRModule,
@@ -77,13 +78,19 @@ const http = createHttpDelivery({
   logError: logHttpDeliveryError,
 });
 
+function isDebugEnabled(): boolean {
+  return transport?.isHttpuvDebug() ?? isLucentDebug();
+}
+
 function log(level: "log" | "error", text: unknown): void {
   const msg = String(text);
   if (level === "error" && msg.startsWith("Error")) {
     postToHost({ type: RWASM.LOG, level: "error", text: msg });
     return;
   }
-  postToHost({ type: RWASM.LOG, level: "log", text: msg });
+  if (isDebugEnabled()) {
+    postToHost({ type: RWASM.LOG, level: "log", text: msg });
+  }
 }
 
 function maybeAnnounceComlinkReady(): void {
@@ -407,13 +414,13 @@ function exposeRHost(port: MessagePort): void {
   });
   Comlink.expose(api, port);
   rHostPortReady = true;
-  console.info("[rWasmWorker] Comlink: exposing unified host API");
+  lucentInfo("[rWasmWorker] Comlink: exposing unified host API");
 }
 
 function connectSwDelivery(port: MessagePort): void {
   swDelivery = Comlink.wrap<SwDeliveryApi>(port);
   swDeliveryPortReady = true;
-  console.info("[rWasmWorker] Comlink: connected to SW delivery API");
+  lucentInfo("[rWasmWorker] Comlink: connected to SW delivery API");
   maybeAnnounceComlinkReady();
 }
 
@@ -490,7 +497,7 @@ async function onMessage(event: MessageEvent): Promise<void> {
           mountedAssetBaseUrl === rAssetBaseUrl &&
           mountedHostPrefixDir === prefix
         ) {
-          console.info("[rWasmWorker] remount skipped (prefix unchanged)");
+          lucentInfo("[rWasmWorker] remount skipped (prefix unchanged)");
           replyOk(data.id);
           break;
         }
@@ -521,27 +528,23 @@ async function onMessage(event: MessageEvent): Promise<void> {
       try {
         await ensureRModule();
         let hadWork = false;
-        let status: Record<string, unknown> = {};
         await tasks.enqueueRTask(() => {
           if (!rModule) {
             return;
           }
           tasks.evalRNow(SHINY_HOST.serviceOnceHadWork);
-          // evalR returns an SEXP pointer — read JSON status from the flag file.
           try {
             const raw = rModule.FS.readFile("/tmp/lucent-service-had-work", {
               encoding: "utf8",
             }).trim();
             if (raw === "1" || raw === "0") {
               hadWork = raw === "1";
-              status = { had: hadWork, legacy: true };
             } else {
-              status = JSON.parse(raw) as Record<string, unknown>;
+              const status = JSON.parse(raw) as { had?: boolean };
               hadWork = Boolean(status.had);
             }
           } catch {
             hadWork = false;
-            status = { parseError: true };
           }
         });
         postToHost({ type: RWASM.SERVICE_STATUS, hadWork });

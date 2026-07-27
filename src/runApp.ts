@@ -1,4 +1,5 @@
 import { LUCENT_CONFIG_PARAM, resolveLucentConfig, type LucentConfig } from "./config";
+import { forwardRWorkerLog, isLucentDebug, lucentInfo } from "./debug";
 import { RWASM } from "./rwasm-constants";
 import { createServiceDriver, type ServiceDriver } from "./rWasmServiceDriver";
 import { loadTransport, type HttpuvTransport } from "./transport";
@@ -89,7 +90,7 @@ function announceHostToServiceWorker(): boolean {
   const controller = navigator.serviceWorker.controller;
   if (controller) {
     controller.postMessage(msg);
-    console.info("[httpuv] Announced host to service worker");
+    lucentInfo("[httpuv] Announced host to service worker");
     return true;
   }
   return false;
@@ -199,7 +200,7 @@ async function cleanupStaleHttpuvServiceWorkers(): Promise<void> {
       continue;
     }
     if (!scriptUrls.includes(expected)) {
-      console.info("[httpuv] Unregistering stale service worker", scriptUrls);
+      lucentInfo("[httpuv] Unregistering stale service worker", scriptUrls);
       await reg.unregister();
     }
   }
@@ -229,7 +230,7 @@ async function registerHttpuvServiceWorker(): Promise<ServiceWorkerRegistration 
       const reloaded = sessionStorage.getItem(HTTPUV_SW_RELOAD_KEY);
       if (!reloaded) {
         sessionStorage.setItem(HTTPUV_SW_RELOAD_KEY, "1");
-        console.info("[httpuv] Service worker installed — reloading once to activate");
+        lucentInfo("[httpuv] Service worker installed — reloading once to activate");
         window.location.reload();
         await new Promise(() => {});
       }
@@ -242,7 +243,7 @@ async function registerHttpuvServiceWorker(): Promise<ServiceWorkerRegistration 
 
     await waitForServiceWorkerController().catch(() => undefined);
     announceHostToServiceWorker();
-    console.info("[httpuv] Service worker registered", {
+    lucentInfo("[httpuv] Service worker registered", {
       scope: reg.scope,
       shinyPrefix: shinyPrefix(),
       controller: Boolean(navigator.serviceWorker.controller),
@@ -274,8 +275,7 @@ function postToRWorker(
       const data = event.data as RWorkerMessage | undefined;
       if (!data || data.id !== id) {
         if (data?.type === RWASM.LOG) {
-          const fn = data.level === "error" ? console.error : console.log;
-          fn(`[rWasmWorker] ${data.text}`);
+          forwardRWorkerLog(data.level === "error" ? "error" : "log", data.text ?? "");
         }
         if (data?.type === RWASM.ERROR && !msg.id) {
           worker.removeEventListener("message", onMessage);
@@ -336,13 +336,12 @@ function createRWorker(): Promise<Worker> {
     const onBoot = (event: MessageEvent) => {
       const data = event.data as RWorkerMessage | undefined;
       if (data?.type === RWASM.LOG) {
-        const fn = data.level === "error" ? console.error : console.log;
-        fn(`[rWasmWorker] ${data.text}`);
+        forwardRWorkerLog(data.level === "error" ? "error" : "log", data.text ?? "");
         return;
       }
       if (data?.type === RWASM.READY) {
         worker.removeEventListener("message", onBoot);
-        console.info("[runApp] R.wasm worker ready");
+        lucentInfo("[runApp] R.wasm worker ready");
         resolve(worker);
         return;
       }
@@ -386,12 +385,12 @@ async function ensureComlinkConnected(): Promise<void> {
   }
 
   comlinkPromise = (async () => {
-    console.info("[runApp] Waiting for R worker and service worker…");
+    lucentInfo("[runApp] Waiting for R worker and service worker…");
     const [worker] = await Promise.all([ensureRWorker(), ensureHttpuvServiceWorker()]);
     if (!navigator.serviceWorker.controller || !controllerMatchesExpectedScript()) {
       throw new Error("Service worker controller is not available");
     }
-    console.info("[runApp] Connecting Comlink…");
+    lucentInfo("[runApp] Connecting Comlink…");
     await connectHttpuvComlink(worker, requireTransport().COMLINK.PORT_HANDOFF);
     comlinkConnected = true;
   })();
@@ -425,7 +424,7 @@ function stopRunningApp(): void {
   if (rWorker) {
     rWorker.postMessage({ type: RWASM.STOP_APP });
   }
-  console.info("[runApp] App stopped");
+  lucentInfo("[runApp] App stopped");
 }
 
 function loadViewerFrame(): void {
@@ -434,7 +433,7 @@ function loadViewerFrame(): void {
   if (frame) {
     frame.src = url;
   }
-  console.info("[runApp] Viewer iframe →", url);
+  lucentInfo("[runApp] Viewer iframe →", url);
 }
 
 function clearAppDocumentCache(): void {
@@ -454,7 +453,7 @@ async function syncResourcePathsToServiceWorker(worker: Worker): Promise<void> {
     const paths = data.paths ?? {};
     controller.postMessage({ type: requireTransport().MSG.REGISTER_RESOURCE_PATHS, paths });
     if (Object.keys(paths).length > 0) {
-      console.info("[runApp] synced", Object.keys(paths).length, "resource path(s) to SW");
+      lucentInfo("[runApp] synced", Object.keys(paths).length, "resource path(s) to SW");
     }
   } catch (err) {
     console.warn("[runApp] resource path sync failed; SW will use static fallbacks", err);
@@ -464,7 +463,7 @@ async function syncResourcePathsToServiceWorker(worker: Worker): Promise<void> {
 async function waitForShinyHttpReady(worker: Worker): Promise<void> {
   const t = requireTransport();
   const url = appUrl();
-  console.info("[runApp] Warming up Shiny (may take a minute on first load)…", url);
+  lucentInfo("[runApp] Warming up Shiny (may take a minute on first load)…", url);
   const res = await fetch(url, {
     cache: "no-store",
     headers: { [t.WARMUP_REQUEST_HEADER]: "1" },
@@ -473,7 +472,7 @@ async function waitForShinyHttpReady(worker: Worker): Promise<void> {
   if (!res.ok) {
     throw new Error(`Shiny warmup GET ${url} failed: HTTP ${res.status}`);
   }
-  console.info("[runApp] Shiny warmup OK (HTTP", res.status + ")");
+  lucentInfo("[runApp] Shiny warmup OK (HTTP", res.status + ")");
   await syncResourcePathsToServiceWorker(worker);
 }
 
@@ -524,7 +523,7 @@ async function loadAppFiles(): Promise<AppFile[]> {
       return { path: rel, data: new Uint8Array(await res.arrayBuffer()) };
     }),
   );
-  console.info("[runApp] loaded", files.length, "app file(s) from", dirUrl);
+  lucentInfo("[runApp] loaded", files.length, "app file(s) from", dirUrl);
   return files;
 }
 
@@ -548,7 +547,7 @@ export async function runApp(files: AppFile[]): Promise<number> {
   const transfer = files.map((f) => f.data.buffer as ArrayBuffer);
   await postToRWorker(worker, { type: RWASM.WRITE_WEB_APP_FILES, files }, transfer);
 
-  console.info("[runApp] worker eval", RUN_WEB_APP_R);
+  lucentInfo("[runApp] worker eval", RUN_WEB_APP_R);
   await postToRWorker(worker, {
     type: RWASM.EVAL,
     code: RUN_WEB_APP_R,
@@ -598,13 +597,13 @@ function installGlobalHelpers(): void {
       }
 
       const openUrl = new URL("__session__/open", appUrl());
-      console.info("[lucent] testVirtualSocket: open", openUrl.href);
+      lucentInfo("[lucent] testVirtualSocket: open", openUrl.href);
       const openRes = await fetch(openUrl, { method: "POST" });
       if (!openRes.ok) {
         throw new Error(`session open failed: HTTP ${openRes.status} ${await openRes.text()}`);
       }
       const { handle } = (await openRes.json()) as { handle: string };
-      console.info("[lucent] testVirtualSocket: handle", handle);
+      lucentInfo("[lucent] testVirtualSocket: handle", handle);
 
       const recvUrl = new URL(`__session__/recv?handle=${encodeURIComponent(handle)}`, appUrl());
       const sendUrl = new URL(`__session__/send?handle=${encodeURIComponent(handle)}`, appUrl());
@@ -621,7 +620,7 @@ function installGlobalHelpers(): void {
       const recvRes = await recvPromise;
       const body = await recvRes.text();
       const result = { handle, status: recvRes.status, body };
-      console.info("[lucent] testVirtualSocket: result", result);
+      lucentInfo("[lucent] testVirtualSocket: result", result);
       return result;
     },
   };
@@ -634,8 +633,8 @@ async function main(): Promise<void> {
   installHostServiceWorkerListeners();
   installGlobalHelpers();
 
-  if (transport.isHttpuvDebug()) {
-    console.info("[runApp] httpuv debug tracing enabled (?httpuvDebug=1)");
+  if (isLucentDebug()) {
+    lucentInfo("[runApp] httpuv debug tracing enabled (?httpuvDebug=1)");
   }
 
   // Register the service worker while R.wasm boots (do not block on the worker).
