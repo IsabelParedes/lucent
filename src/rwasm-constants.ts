@@ -28,6 +28,6 @@ export const RWASM = {
   SERVICE_STATUS: "rwasm_service_status",
   /** Worker → main: schedule an immediate rAF wake. */
   NEED_SERVICE: "rwasm_need_service",
-  /** Worker → main: delayed wake (`delayMs`) via setTimeout then rAF. */
+  /** Worker → main: delayed wake (`delayMs`) via setTimeout then MessageChannel. */
   SCHEDULE_DELAY: "rwasm_schedule_delay",
 } as const;

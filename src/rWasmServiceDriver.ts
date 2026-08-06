@@ -1,9 +1,9 @@
 import { RWASM } from "./rwasm-constants";
 
 export type ServiceDriver = {
-  /** Ensure an rAF tick is scheduled (idempotent). */
+  /** Ensure an rAF tick is scheduled (idempotent; visible tabs only). */
   wake: () => void;
-  /** Schedule a delayed wake via setTimeout → rAF (breaks chained-timer loops). */
+  /** Schedule a delayed wake via setTimeout → MessageChannel (breaks chained-timer loops). */
   scheduleDelay: (delayMs: number) => void;
   /** Attach to a worker; replaces any previous attachment. */
   attach: (worker: Worker) => void;
@@ -28,9 +28,10 @@ type ScheduleDelayMessage = {
 /**
  * Main-thread Shiny service driver.
  *
- * Visible work is paced with requestAnimationFrame (pauses when the tab is
- * hidden). Immediate follow-ups prefer setTimeout(0) so Chrome does not defer
- * ticks while DevTools is open or focus is inside the Shiny iframe.
+ * Immediate follow-ups use a MessageChannel macrotask so Chrome does not
+ * throttle nested setTimeout(0) chains while DevTools is open or focus is
+ * inside the Shiny iframe. requestAnimationFrame only coalesces visible work
+ * (it pauses when the tab is hidden).
  */
 export function createServiceDriver(): ServiceDriver {
   let worker: Worker | null = null;
@@ -44,12 +45,31 @@ export function createServiceDriver(): ServiceDriver {
   /** Absolute deadline (performance.now) of the soonest pending delay, or Infinity. */
   let delayDeadline = Infinity;
 
+  // MessageChannel macrotasks avoid nested-setTimeout clamping / DevTools deferral
+  // (same approach as rWasmTasks.ts on the worker).
+  const soonChannel = new MessageChannel();
+  soonChannel.port1.onmessage = () => {
+    if (!soonPending) {
+      // Cancelled by clearSoon / stop / scheduleDelay coalescing.
+      return;
+    }
+    soonPending = false;
+    if (stopped || !worker) {
+      return;
+    }
+    postTick();
+  };
+
+  function clearSoon(): void {
+    soonPending = false;
+  }
+
   function clearDelayTimers(): void {
     for (const id of delayTimers) {
       clearTimeout(id);
     }
     delayTimers.clear();
-    soonPending = false;
+    clearSoon();
     delayDeadline = Infinity;
   }
 
@@ -87,6 +107,10 @@ export function createServiceDriver(): ServiceDriver {
     if (stopped || !worker) {
       return;
     }
+    // rAF is paused while the tab is hidden; MessageChannel covers that case.
+    if (document.visibilityState !== "visible") {
+      return;
+    }
     if (tickInFlight) {
       wakeQueued = true;
       return;
@@ -101,8 +125,8 @@ export function createServiceDriver(): ServiceDriver {
 
   /**
    * Immediate wake that does not wait for the next animation frame.
-   * Chrome often defers parent-page rAF while focus is inside the Shiny iframe
-   * or while DevTools is open; a 0ms timer still runs promptly enough.
+   * Uses MessageChannel instead of setTimeout(0) so Chrome does not clamp
+   * chained timers when DevTools is open or the Shiny iframe has focus.
    */
   function wakeSoon(): void {
     if (stopped || !worker) {
@@ -117,15 +141,10 @@ export function createServiceDriver(): ServiceDriver {
       return;
     }
     soonPending = true;
-    const id = setTimeout(() => {
-      delayTimers.delete(id);
-      soonPending = false;
-      postTick();
-    }, 0);
-    delayTimers.add(id);
+    soonChannel.port2.postMessage(0);
   }
 
-  /** Schedule an immediate service tick; timer first, rAF as backup. */
+  /** Schedule an immediate service tick; MessageChannel first, rAF as visible backup. */
   function scheduleFollowUp(): void {
     wakeSoon();
     wake();
