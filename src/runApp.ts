@@ -408,11 +408,13 @@ function reconnectComlinkAfterServiceWorkerUpdate(): void {
 }
 
 export async function ensureHttpuvReady(): Promise<void> {
-  if (!httpuvReadyPromise) {
-    const t = requireTransport();
-    t.setShinyPrefix(shinyPrefix());
-    httpuvReadyPromise = ensureComlinkConnected();
+  const t = requireTransport();
+  t.setShinyPrefix(shinyPrefix());
+  // Do not treat a stale resolved promise as ready after SW reset/reconnect.
+  if (comlinkConnected && comlinkPromise) {
+    return comlinkPromise;
   }
+  httpuvReadyPromise = ensureComlinkConnected();
   return httpuvReadyPromise;
 }
 
@@ -565,8 +567,13 @@ async function startShinyApp(): Promise<void> {
   const worker = await ensureRWorker();
   const files = await loadAppFiles();
   await runApp(files);
+  // Remount / SW activate can drop the worker link after the first handshake.
+  // Re-assert Comlink before warmup so GET /shiny/ does not race PORT_HANDOFF.
+  comlinkConnected = false;
+  comlinkPromise = null;
+  httpuvReadyPromise = null;
+  await ensureHttpuvReady();
   await waitForShinyHttpReady(worker);
-  await ensureComlinkConnected();
   loadViewerFrame();
 }
 
