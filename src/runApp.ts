@@ -588,6 +588,24 @@ function installHostServiceWorkerListeners(): void {
       reconnectComlinkAfterServiceWorkerUpdate();
     }
   });
+
+  // Chromium stops the SW while idle and forgets hostClientId. Re-announce the
+  // Lucent shell (not the /shiny/ iframe) whenever we become visible again.
+  const reassertHost = () => {
+    announceHostToServiceWorker();
+    if (!comlinkConnected) {
+      reconnectComlinkAfterServiceWorkerUpdate();
+    }
+  };
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      reassertHost();
+    }
+  });
+  window.addEventListener("pageshow", reassertHost);
+  window.addEventListener("focus", () => {
+    announceHostToServiceWorker();
+  });
 }
 
 function installGlobalHelpers(): void {
@@ -598,10 +616,12 @@ function installGlobalHelpers(): void {
     enableHttpuvDebug: () => requireTransport().enableHttpuvDebug(),
     async testVirtualSocket(message = '{"method":"ping"}') {
       await ensureHttpuvReady();
-      if (!navigator.serviceWorker.controller) {
+      const controller = navigator.serviceWorker.controller;
+      if (!controller) {
         console.warn(
           "[lucent] No service worker controller — fetch may not be intercepted; unregister old workers and hard-refresh",
         );
+        throw new Error("no service worker controller");
       }
 
       const openUrl = new URL("__session__/open", appUrl());
@@ -613,9 +633,24 @@ function installGlobalHelpers(): void {
       const { handle } = (await openRes.json()) as { handle: string };
       lucentInfo("[lucent] testVirtualSocket: handle", handle);
 
-      const recvUrl = new URL(`__session__/recv?handle=${encodeURIComponent(handle)}`, appUrl());
+      const channel = new MessageChannel();
+      const ack = new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("session ACK timed out")), 5_000);
+        channel.port1.onmessage = (event: MessageEvent<{ type?: string }>) => {
+          if (event.data?.type === requireTransport().MSG.SESSION_ACK) {
+            clearTimeout(timer);
+            resolve();
+          }
+        };
+      });
+      controller.postMessage(
+        { type: requireTransport().MSG.REGISTER_SESSION, handle },
+        [channel.port2],
+      );
+      await ack;
+      lucentInfo("[lucent] testVirtualSocket: session port registered");
+
       const sendUrl = new URL(`__session__/send?handle=${encodeURIComponent(handle)}`, appUrl());
-      const recvPromise = fetch(recvUrl);
       const sendRes = await fetch(sendUrl, {
         method: "POST",
         headers: { "Content-Type": "text/plain" },
@@ -625,9 +660,8 @@ function installGlobalHelpers(): void {
         throw new Error(`session send failed: HTTP ${sendRes.status}`);
       }
 
-      const recvRes = await recvPromise;
-      const body = await recvRes.text();
-      const result = { handle, status: recvRes.status, body };
+      channel.port1.close();
+      const result = { handle, registered: true, sendStatus: sendRes.status };
       lucentInfo("[lucent] testVirtualSocket: result", result);
       return result;
     },

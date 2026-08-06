@@ -9,6 +9,9 @@ export interface MsgTypes {
   CLEAR_APP_CACHE: string;
   REGISTER_RESOURCE_PATHS: string;
   REQUEST_COMLINK: string;
+  REGISTER_SESSION: string;
+  SESSION_ACK: string;
+  REQUEST_SESSION_PORT: string;
   [key: string]: string;
 }
 
