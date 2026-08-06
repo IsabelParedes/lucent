@@ -6,11 +6,11 @@ import type { HostInboundMessage } from "./wiring";
 /** Service rounds after push idle wait (promise resolution only). */
 const HTTP_PUSH_DRAIN_ROUNDS = 128;
 
-/** Poll interval while waiting for emscripten later timers (no evalR). */
-const HTTP_IDLE_POLL_MS = 16;
-
-/** Yield between drain rounds so emscripten later timers can fire. */
-const HTTP_DRAIN_YIELD_MS = 4;
+type HttpDrainState = {
+  resolved: boolean;
+  /** Settles the idle-wait Promise when the HTTP response arrives. */
+  notify?: () => void;
+};
 
 interface HttpDeliveryItem {
   req: HostInboundMessage;
@@ -22,7 +22,7 @@ export type HttpDeliveryDeps = {
   tasks: RTaskQueue;
   getModule: () => RModule | null;
   requireTransport: () => HttpuvTransport;
-  /** Wake the main-thread rAF service driver. */
+  /** Wake the main-thread service driver. */
   requestService: () => void;
   dbg: (stage: string, ...args: unknown[]) => void;
   formatError: (err: unknown) => string;
@@ -46,22 +46,39 @@ export function createHttpDelivery(deps: HttpDeliveryDeps): HttpDelivery {
   let activeHttpDrainUuid: string | null = null;
 
   const httpDeliveryQueue: HttpDeliveryItem[] = [];
-  const httpDrainByUuid = new Map<string, { resolved: boolean }>();
+  const httpDrainByUuid = new Map<string, HttpDrainState>();
 
-  function yieldMs(ms: number): Promise<void> {
-    return new Promise((resolve) => {
-      setTimeout(resolve, ms);
-    });
-  }
-
+  /**
+   * Wait until noteHttpResponse marks the request resolved, or maxMs elapses.
+   * Event-driven (no setTimeout poll); one deadline timer is the upper bound.
+   */
   async function idleWaitForHttpResponse(
-    state: { resolved: boolean },
+    state: HttpDrainState,
     uuid: string,
     maxMs = httpIdleMaxMs,
   ): Promise<void> {
     const start = Date.now();
-    while (!state.resolved && Date.now() - start < maxMs) {
-      await yieldMs(HTTP_IDLE_POLL_MS);
+    if (!state.resolved) {
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const done = () => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          clearTimeout(timer);
+          if (state.notify === done) {
+            state.notify = undefined;
+          }
+          resolve();
+        };
+        state.notify = done;
+        const timer = setTimeout(done, maxMs);
+        // Response may have arrived between the resolved check and notify assign.
+        if (state.resolved) {
+          done();
+        }
+      });
     }
     deps.dbg("worker-push-idle-done", {
       uuid,
@@ -117,7 +134,7 @@ export function createHttpDelivery(deps: HttpDeliveryDeps): HttpDelivery {
   function drainAfterHttpPush(
     roundsLeft: number,
     uuid: string,
-    state: { resolved: boolean },
+    state: HttpDrainState,
   ): Promise<void> {
     if (roundsLeft <= 0 || !deps.getModule() || state.resolved) {
       if (!state.resolved) {
@@ -137,10 +154,16 @@ export function createHttpDelivery(deps: HttpDeliveryDeps): HttpDelivery {
     });
   }
 
+  function yieldMacrotask(): Promise<void> {
+    return new Promise((resolve) => {
+      deps.tasks.scheduleMacrotask(() => resolve());
+    });
+  }
+
   async function deliverOneHttpRequest(req: HostInboundMessage): Promise<void> {
     const uuid = req.uuid ?? "";
     const url = req.url ?? "";
-    const state = { resolved: false };
+    const state: HttpDrainState = { resolved: false };
     httpDrainByUuid.set(uuid, state);
     httpDeliveryInflight++;
     activeHttpDrainUuid = uuid;
@@ -158,14 +181,14 @@ export function createHttpDelivery(deps: HttpDeliveryDeps): HttpDelivery {
 
         // Only force serviceOnce drains when the HTTP response never arrived.
         // Session open/send already returns 204; reactive flush is owned by the
-        // main-thread rAF driver via requestService() after inflight clears.
+        // main-thread service driver via requestService() after inflight clears.
         if (!state.resolved) {
           await drainAfterHttpPush(HTTP_PUSH_DRAIN_ROUNDS, uuid, state);
         } else if (sessionHttp) {
           deps.dbg("worker-session-skip-drain", { uuid });
         }
       } else if (!state.resolved) {
-        await yieldMs(HTTP_DRAIN_YIELD_MS);
+        await yieldMacrotask();
       }
     } finally {
       httpDrainByUuid.delete(uuid);
@@ -173,7 +196,7 @@ export function createHttpDelivery(deps: HttpDeliveryDeps): HttpDelivery {
         activeHttpDrainUuid = null;
       }
       httpDeliveryInflight--;
-      // Host rAF continues reactive work after session open/send completes.
+      // Host continues reactive work after session open/send completes.
       if (sessionHttp) {
         deps.requestService();
       }
@@ -248,9 +271,11 @@ export function createHttpDelivery(deps: HttpDeliveryDeps): HttpDelivery {
     hasHttpWork: () => httpDeliveryInflight > 0 || httpDeliveryQueue.length > 0,
     noteHttpResponse(uuid: string | undefined) {
       const drainState = uuid ? httpDrainByUuid.get(uuid) : undefined;
-      if (drainState) {
-        drainState.resolved = true;
+      if (!drainState || drainState.resolved) {
+        return;
       }
+      drainState.resolved = true;
+      drainState.notify?.();
     },
     enqueueHttpDelivery,
   };
