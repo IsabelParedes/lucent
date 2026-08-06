@@ -24,10 +24,12 @@ export const RWASM = {
   ERROR: "rwasm_error",
   /** Main → worker: run one shiny::serviceOnce tick. */
   SERVICE_TICK: "rwasm_service_tick",
-  /** Worker → main: result of a SERVICE_TICK (`hadWork` continues rAF). */
+  /** Worker → main: result of a SERVICE_TICK (`hadWork` / `nextDelayMs`). */
   SERVICE_STATUS: "rwasm_service_status",
-  /** Worker → main: schedule an immediate rAF wake. */
+  /** Worker → main: schedule an immediate MessageChannel wake. */
   NEED_SERVICE: "rwasm_need_service",
-  /** Worker → main: delayed wake (`delayMs`) via setTimeout then MessageChannel. */
+  /** Worker → main: delayed wake (`delayMs`) via setTimeout then MessageChannel.
+   * Used when scheduleTask runs outside a SERVICE_TICK; idle delays after a tick
+   * go through SERVICE_STATUS.nextDelayMs instead. */
   SCHEDULE_DELAY: "rwasm_schedule_delay",
 } as const;

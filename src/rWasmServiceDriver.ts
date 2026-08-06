@@ -14,6 +14,8 @@ export type ServiceDriver = {
 type ServiceStatusMessage = {
   type: typeof RWASM.SERVICE_STATUS;
   hadWork?: boolean;
+  /** Ms until next R timer, or -1 / omitted when idle. */
+  nextDelayMs?: number;
 };
 
 type NeedServiceMessage = {
@@ -64,13 +66,18 @@ export function createServiceDriver(): ServiceDriver {
     soonPending = false;
   }
 
-  function clearDelayTimers(): void {
+  /** Cancel pending setTimeout delays only (leave MessageChannel wakes alone). */
+  function clearDelayOnly(): void {
     for (const id of delayTimers) {
       clearTimeout(id);
     }
     delayTimers.clear();
-    clearSoon();
     delayDeadline = Infinity;
+  }
+
+  function clearDelayTimers(): void {
+    clearDelayOnly();
+    clearSoon();
   }
 
   function cancelRaf(): void {
@@ -164,7 +171,7 @@ export function createServiceDriver(): ServiceDriver {
     if (deadline >= delayDeadline) {
       return;
     }
-    clearDelayTimers();
+    clearDelayOnly();
     delayDeadline = deadline;
     const id = setTimeout(() => {
       delayTimers.delete(id);
@@ -186,13 +193,23 @@ export function createServiceDriver(): ServiceDriver {
 
     if (data.type === RWASM.SERVICE_STATUS) {
       tickInFlight = false;
-      const hadWork = Boolean((data as ServiceStatusMessage).hadWork);
+      const status = data as ServiceStatusMessage;
+      const hadWork = Boolean(status.hadWork);
+      const nextDelayMs = Number(status.nextDelayMs);
       if (stopped) {
         return;
       }
       if (hadWork || wakeQueued) {
         wakeQueued = false;
         scheduleFollowUp();
+        return;
+      }
+      // Host owns the post-tick delay timer (R no longer scheduleHostDelay from serviceOnce).
+      if (Number.isFinite(nextDelayMs) && nextDelayMs >= 0) {
+        scheduleDelay(nextDelayMs);
+      } else {
+        // Idle or cancelled timers: drop any stale delay (keep MessageChannel wakes).
+        clearDelayOnly();
       }
       return;
     }

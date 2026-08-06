@@ -528,6 +528,7 @@ async function onMessage(event: MessageEvent): Promise<void> {
       try {
         await ensureRModule();
         let hadWork = false;
+        let nextDelayMs = -1;
         await tasks.enqueueRTask(() => {
           if (!rModule) {
             return;
@@ -539,18 +540,25 @@ async function onMessage(event: MessageEvent): Promise<void> {
             }).trim();
             if (raw === "1" || raw === "0") {
               hadWork = raw === "1";
+              nextDelayMs = -1;
             } else {
-              const status = JSON.parse(raw) as { had?: boolean };
+              const status = JSON.parse(raw) as {
+                had?: boolean;
+                nextMs?: number;
+              };
               hadWork = Boolean(status.had);
+              const ms = Number(status.nextMs);
+              nextDelayMs = Number.isFinite(ms) && ms >= 0 ? ms : -1;
             }
           } catch {
             hadWork = false;
+            nextDelayMs = -1;
           }
         });
-        postToHost({ type: RWASM.SERVICE_STATUS, hadWork });
+        postToHost({ type: RWASM.SERVICE_STATUS, hadWork, nextDelayMs });
       } catch (err) {
         log("error", `[rWasmWorker] service tick failed: ${formatRWasmError(err)}`);
-        postToHost({ type: RWASM.SERVICE_STATUS, hadWork: false });
+        postToHost({ type: RWASM.SERVICE_STATUS, hadWork: false, nextDelayMs: -1 });
       }
       break;
     }

@@ -36,6 +36,7 @@ interface RWorkerMessage {
   message?: string;
   paths?: Record<string, string>;
   hadWork?: boolean;
+  nextDelayMs?: number;
   delayMs?: number;
 }
 

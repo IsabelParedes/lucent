@@ -14,7 +14,8 @@ export const SHINY_HOST = {
   /**
    * Run serviceOnce and write status JSON to a VFS flag file.
    * Module.evalR returns an SEXP pointer, not the R value — callers must read
-   * the flag file to learn hadWork.
+   * the flag file for hadWork / nextMs. The host arms delays from nextMs on
+   * SERVICE_STATUS (serviceOnce itself does not scheduleHostDelay).
    */
   serviceOnceHadWork: `tryCatch({
   had <- isTRUE(shiny::serviceOnce())
