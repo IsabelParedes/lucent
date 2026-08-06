@@ -110,24 +110,22 @@ async function waitForServiceWorkerController(
   }
 
   return new Promise((resolve, reject) => {
-    let poll: ReturnType<typeof setInterval> | undefined;
-
     const deadline = setTimeout(() => {
-      if (poll) clearInterval(poll);
+      navigator.serviceWorker.removeEventListener("controllerchange", onController);
       reject(new Error("timeout"));
     }, timeoutMs);
 
     const onController = () => {
       if (navigator.serviceWorker.controller) {
         clearTimeout(deadline);
-        if (poll) clearInterval(poll);
         navigator.serviceWorker.removeEventListener("controllerchange", onController);
         resolve(navigator.serviceWorker.controller);
       }
     };
 
     navigator.serviceWorker.addEventListener("controllerchange", onController);
-    poll = setInterval(onController, 100);
+    // Race: controller may appear between ready check and listener attach.
+    onController();
   });
 }
 
