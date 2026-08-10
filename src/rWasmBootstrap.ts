@@ -21,6 +21,23 @@ export interface DownloadProgress {
   percent: number | null;
 }
 
+/** Coarse boot phases (download has its own byte-level channel). */
+export type BootPhase =
+  | "load-runtime"
+  | "download"
+  | "filesystem"
+  | "init-r"
+  | "load-httpuv"
+  | "start-app"
+  | "warmup";
+
+export interface BootStatus {
+  phase: BootPhase;
+  message: string;
+  /** Overall boot estimate 0–100 (null when unknown). */
+  percent: number | null;
+}
+
 /** Minimal view of the initialized Rmain module (from rmain_post.js). */
 export interface RModule {
   FS: EmscriptenFS;
@@ -59,6 +76,7 @@ export interface InitRModuleOptions {
   print?: (text: string) => void;
   printErr?: (text: string) => void;
   onDownloadProgress?: (progress: DownloadProgress) => void;
+  onBootStatus?: (status: BootStatus) => void;
 }
 
 let evalRPostFlush: (() => void) | null = null;
@@ -253,13 +271,22 @@ async function populateFromEmpack(
     empackMetaUrl,
     empackPackagesBaseUrl,
     onDownloadProgress,
-  }: Pick<InitRModuleOptions, "empackMetaUrl" | "empackPackagesBaseUrl" | "onDownloadProgress">,
+    onBootStatus,
+  }: Pick<
+    InitRModuleOptions,
+    "empackMetaUrl" | "empackPackagesBaseUrl" | "onDownloadProgress" | "onBootStatus"
+  >,
 ): Promise<void> {
   if (typeof module.populateFilesystem !== "function") {
     throw new Error(
       "Module.populateFilesystem missing; rebuild r-main with the parameterized rmain_post.js",
     );
   }
+  onBootStatus?.({
+    phase: "download",
+    message: "Downloading packages…",
+    percent: 5,
+  });
   lucentInfo("[rWasm] populateFilesystem", empackMetaUrl);
   await module.populateFilesystem({
     metaUrl: empackMetaUrl,
@@ -272,6 +299,11 @@ async function populateFromEmpack(
     empackMetaUrl,
     empackPackagesBaseUrl,
     onDownloadProgress,
+  });
+  onBootStatus?.({
+    phase: "filesystem",
+    message: "Preparing filesystem…",
+    percent: 62,
   });
   clearVfsBlobUrlCache();
   mountRHomeLibToSlashLib(module);
@@ -374,23 +406,41 @@ export async function remountRHome(
     empackMetaUrl,
     empackPackagesBaseUrl,
     onDownloadProgress,
-  }: Pick<InitRModuleOptions, "empackMetaUrl" | "empackPackagesBaseUrl" | "onDownloadProgress">,
+    onBootStatus,
+  }: Pick<
+    InitRModuleOptions,
+    "empackMetaUrl" | "empackPackagesBaseUrl" | "onDownloadProgress" | "onBootStatus"
+  >,
 ): Promise<void> {
   await populateFromEmpack(Module, {
     empackMetaUrl,
     empackPackagesBaseUrl,
     onDownloadProgress,
+    onBootStatus,
   });
   unloadTransportPackages(Module);
   lucentInfo("[rWasm] Remounted empack env from", empackMetaUrl);
 }
 
-export async function bootstrapRSession(Module: RModule): Promise<void> {
+export async function bootstrapRSession(
+  Module: RModule,
+  onBootStatus?: (status: BootStatus) => void,
+): Promise<void> {
+  onBootStatus?.({
+    phase: "init-r",
+    message: "Initializing R…",
+    percent: 68,
+  });
   const status = Module.initR(["--no-restore", "--no-save", "--vanilla"]);
   if (status !== 0) {
     throw new Error(`R init failed with status ${status}`);
   }
 
+  onBootStatus?.({
+    phase: "load-httpuv",
+    message: "Loading httpuv…",
+    percent: 78,
+  });
   evalR(Module, "suppressPackageStartupMessages(library(httpuv))");
   evalR(Module, 'setwd("/")');
   lucentInfo("[rWasm] R session ready");
@@ -407,9 +457,16 @@ export async function initRModule({
   print,
   printErr,
   onDownloadProgress,
+  onBootStatus,
 }: InitRModuleOptions): Promise<RModule> {
   const moduleRef: { current: RModule | null } = { current: null };
   const locateFile = createFsBackedLocateFile(moduleRef, runtimeBaseUrl);
+
+  onBootStatus?.({
+    phase: "load-runtime",
+    message: "Loading R.wasm runtime…",
+    percent: 2,
+  });
   const createRmain = await loadRmainFactory(runtimeBaseUrl);
 
   const module = {
@@ -439,8 +496,9 @@ export async function initRModule({
     empackMetaUrl,
     empackPackagesBaseUrl,
     onDownloadProgress,
+    onBootStatus,
   });
-  await bootstrapRSession(module);
+  await bootstrapRSession(module, onBootStatus);
 
   // httpuv bridge reads Module.httpuv / Module._rWasmEvalDepth from globalThis.
   globalThis.Module = module;

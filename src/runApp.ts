@@ -38,6 +38,10 @@ interface RWorkerMessage {
   hadWork?: boolean;
   nextDelayMs?: number;
   delayMs?: number;
+  percent?: number | null;
+  downloadedBytes?: number;
+  totalBytes?: number;
+  phase?: string;
 }
 
 function requireTransport(): HttpuvTransport {
@@ -271,9 +275,6 @@ function postToRWorker(
     const onMessage = (event: MessageEvent) => {
       const data = event.data as RWorkerMessage | undefined;
       if (!data || data.id !== id) {
-        if (data?.type === RWASM.LOG) {
-          forwardRWorkerLog(data.level === "error" ? "error" : "log", data.text ?? "");
-        }
         if (data?.type === RWASM.ERROR && !msg.id) {
           worker.removeEventListener("message", onMessage);
           reject(new Error(data.message ?? "R worker failed"));
@@ -320,6 +321,47 @@ function workerConfigParam(): string {
   return JSON.stringify(payload);
 }
 
+function dispatchLucentEvent(
+  name: "lucent:download-progress" | "lucent:boot-status" | "lucent:ready" | "lucent:error",
+  detail?: Record<string, unknown>,
+): void {
+  window.dispatchEvent(new CustomEvent(name, { detail }));
+}
+
+function reportBootStatus(
+  phase: string,
+  message: string,
+  percent: number | null,
+): void {
+  dispatchLucentEvent("lucent:boot-status", { phase, message, percent });
+}
+
+/** Forward worker progress/log side-channels for the whole worker lifetime. */
+function installWorkerUiEvents(worker: Worker): void {
+  worker.addEventListener("message", (event: MessageEvent) => {
+    const data = event.data as RWorkerMessage | undefined;
+    if (data?.type === RWASM.LOG) {
+      forwardRWorkerLog(data.level === "error" ? "error" : "log", data.text ?? "");
+      return;
+    }
+    if (data?.type === RWASM.DOWNLOAD_PROGRESS) {
+      dispatchLucentEvent("lucent:download-progress", {
+        percent: data.percent ?? null,
+        downloadedBytes: data.downloadedBytes ?? 0,
+        totalBytes: data.totalBytes ?? 0,
+      });
+      return;
+    }
+    if (data?.type === RWASM.BOOT_STATUS) {
+      dispatchLucentEvent("lucent:boot-status", {
+        phase: data.phase ?? "",
+        message: data.message ?? "",
+        percent: data.percent ?? null,
+      });
+    }
+  });
+}
+
 function createRWorker(): Promise<Worker> {
   const workerUrl = new URL("./rWasmWorker.js", import.meta.url);
   workerUrl.searchParams.set(LUCENT_CONFIG_PARAM, workerConfigParam());
@@ -327,12 +369,17 @@ function createRWorker(): Promise<Worker> {
     workerUrl.searchParams.set("httpuvDebug", "1");
   }
   const worker = new Worker(workerUrl, { type: "module" });
+  installWorkerUiEvents(worker);
 
   return new Promise((resolve, reject) => {
     const onBoot = (event: MessageEvent) => {
       const data = event.data as RWorkerMessage | undefined;
-      if (data?.type === RWASM.LOG) {
-        forwardRWorkerLog(data.level === "error" ? "error" : "log", data.text ?? "");
+      if (
+        data?.type === RWASM.LOG ||
+        data?.type === RWASM.DOWNLOAD_PROGRESS ||
+        data?.type === RWASM.BOOT_STATUS
+      ) {
+        // Handled by installWorkerUiEvents.
         return;
       }
       if (data?.type === RWASM.READY) {
@@ -461,6 +508,7 @@ async function syncResourcePathsToServiceWorker(worker: Worker): Promise<void> {
 async function waitForShinyHttpReady(worker: Worker): Promise<void> {
   const t = requireTransport();
   const url = appUrl();
+  reportBootStatus("warmup", "Warming up Shiny…", 92);
   lucentInfo("[runApp] Warming up Shiny (may take a minute on first load)…", url);
   const res = await fetch(url, {
     cache: "no-store",
@@ -491,6 +539,7 @@ export async function runApp(): Promise<number> {
   await postToRWorker(worker, { type: RWASM.REMOUNT_R_HOME, force: forceRemount });
 
   lucentInfo("[runApp] worker eval", RUN_WEB_APP_R);
+  reportBootStatus("start-app", "Starting Shiny…", 85);
   await postToRWorker(worker, {
     type: RWASM.EVAL,
     code: RUN_WEB_APP_R,
@@ -515,6 +564,7 @@ async function startShinyApp(): Promise<void> {
   await ensureHttpuvReady();
   await waitForShinyHttpReady(worker);
   loadViewerFrame();
+  dispatchLucentEvent("lucent:ready");
 }
 
 function installHostServiceWorkerListeners(): void {
@@ -628,4 +678,7 @@ async function main(): Promise<void> {
 
 void main().catch((err) => {
   console.error("[runApp] Failed to start:", err);
+  dispatchLucentEvent("lucent:error", {
+    message: err instanceof Error ? err.message : String(err),
+  });
 });

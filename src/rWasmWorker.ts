@@ -7,6 +7,7 @@ import {
   initRModule,
   remountRHome,
   setEvalRPostFlush,
+  type BootStatus,
   type DownloadProgress,
   type RModule,
 } from "./rWasmBootstrap";
@@ -318,6 +319,22 @@ function onDownloadProgress(progress: DownloadProgress): void {
   lucentInfo(
     `[rWasm] download ${pct} (${progress.downloadedBytes}/${progress.totalBytes})`,
   );
+  postToHost({
+    type: RWASM.DOWNLOAD_PROGRESS,
+    percent: progress.percent,
+    downloadedBytes: progress.downloadedBytes,
+    totalBytes: progress.totalBytes,
+  });
+}
+
+function onBootStatus(status: BootStatus): void {
+  lucentInfo(`[rWasm] boot [${status.phase}] ${status.message}`);
+  postToHost({
+    type: RWASM.BOOT_STATUS,
+    phase: status.phase,
+    message: status.message,
+    percent: status.percent,
+  });
 }
 
 async function initEverything(): Promise<RModule> {
@@ -337,6 +354,7 @@ async function initEverything(): Promise<RModule> {
     print: (text) => log("log", text),
     printErr: (text) => log("error", text),
     onDownloadProgress,
+    onBootStatus,
   });
   rModule = module;
   mountedRuntimeKey = empackMountKey();
@@ -514,6 +532,7 @@ async function onMessage(event: MessageEvent): Promise<void> {
           empackMetaUrl,
           empackPackagesBaseUrl,
           onDownloadProgress,
+          onBootStatus,
         });
         mountedRuntimeKey = key;
         replyOk(data.id);

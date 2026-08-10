@@ -17,6 +17,10 @@ export const RWASM = {
   GET_RESOURCE_PATHS: "rwasm_get_resource_paths",
   RESOURCE_PATHS: "rwasm_resource_paths",
   LOG: "rwasm_log",
+  /** Worker → main: empack package download progress. */
+  DOWNLOAD_PROGRESS: "rwasm_download_progress",
+  /** Worker → main: coarse boot phase updates after / around downloads. */
+  BOOT_STATUS: "rwasm_boot_status",
   ERROR: "rwasm_error",
   /** Main → worker: run one shiny::serviceOnce tick. */
   SERVICE_TICK: "rwasm_service_tick",
