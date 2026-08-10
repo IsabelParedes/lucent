@@ -69,7 +69,6 @@ function serviceWorkerScriptUrl(): URL {
   // Tell the SW its mount prefix up-front so it intercepts correctly before the
   // REGISTER_HOST message arrives (avoids a first-load race on asset requests).
   url.searchParams.set("shinyPrefix", shinyPrefix());
-  url.searchParams.set("hostPrefix", config.hostPrefixDir);
   return url;
 }
 
@@ -86,7 +85,6 @@ function announceHostToServiceWorker(): boolean {
   const msg = {
     type: t.MSG.REGISTER_HOST,
     shinyPrefix: prefix,
-    hostPrefix: config.hostPrefixDir,
   };
   const controller = navigator.serviceWorker.controller;
   if (controller) {
@@ -315,10 +313,9 @@ function workerConfigParam(): string {
     transportBaseUrl: abs(config.transportBaseUrl),
     serviceWorkerUrl: abs(config.serviceWorkerUrl),
     rRuntimeBaseUrl: abs(config.rRuntimeBaseUrl),
-    hostPrefixDir: config.hostPrefixDir,
+    empackMetaUrl: abs(config.empackMetaUrl),
+    empackPackagesBaseUrl: abs(config.empackPackagesBaseUrl),
     shinyBaseUrl: abs(config.shinyBaseUrl),
-    appDirUrl: abs(config.appDirUrl),
-    appManifestUrl: abs(config.appManifestUrl),
   };
   return JSON.stringify(payload);
 }
@@ -477,76 +474,21 @@ async function waitForShinyHttpReady(worker: Worker): Promise<void> {
   await syncResourcePathsToServiceWorker(worker);
 }
 
-interface AppFile {
-  path: string;
-  data: Uint8Array;
-}
-
-function appDirUrl(): string {
-  return config.appDirUrl ?? new URL("webApp/", self.location.href).href;
-}
-
 /**
- * Resolve the list of app files. A browser cannot enumerate a directory over
- * HTTP, so we rely on a `manifest.json` ({ files: string[] }) alongside the app.
- * The local dev server (serve.mjs) generates this automatically; static hosts
- * can ship one. Falls back to a lone `app.R` if no manifest is available.
+ * Start (or restart) the Shiny app already present in the VFS at `/webApp`
+ * (populated via empack pack dir + append during R bootstrap).
  */
-async function fetchAppFileList(dirUrl: string): Promise<string[]> {
-  const manifestUrl = config.appManifestUrl ?? new URL("manifest.json", dirUrl).href;
-  try {
-    const res = await fetch(manifestUrl, { cache: "no-store" });
-    if (res.ok) {
-      const data = (await res.json()) as { files?: unknown };
-      if (Array.isArray(data.files) && data.files.length > 0) {
-        return data.files.filter((f): f is string => typeof f === "string");
-      }
-      console.warn(`[runApp] app manifest ${manifestUrl} had no files; falling back to app.R`);
-    } else {
-      console.warn(`[runApp] app manifest ${manifestUrl} → HTTP ${res.status}; falling back to app.R`);
-    }
-  } catch (err) {
-    console.warn("[runApp] app manifest fetch failed; falling back to app.R", err);
-  }
-  return ["app.R"];
-}
-
-async function loadAppFiles(): Promise<AppFile[]> {
-  const dirUrl = appDirUrl();
-  const list = await fetchAppFileList(dirUrl);
-  const files = await Promise.all(
-    list.map(async (rel): Promise<AppFile> => {
-      const fileUrl = new URL(rel, dirUrl);
-      const res = await fetch(fileUrl, { cache: "no-store" });
-      if (!res.ok) {
-        throw new Error(`Failed to fetch app file ${fileUrl.href}: HTTP ${res.status}`);
-      }
-      return { path: rel, data: new Uint8Array(await res.arrayBuffer()) };
-    }),
-  );
-  lucentInfo("[runApp] loaded", files.length, "app file(s) from", dirUrl);
-  return files;
-}
-
-export async function runApp(files: AppFile[]): Promise<number> {
-  if (files.length === 0) {
-    console.warn("[runApp] No app files to run");
-    return 1;
-  }
-
+export async function runApp(): Promise<number> {
   const worker = await ensureRWorker();
 
   clearAppDocumentCache();
   await postToRWorker(worker, { type: RWASM.STOP_APP });
 
   // Remount only when forced (?remountRHome=1) or when the worker detects that
-  // rRuntimeBaseUrl / hostPrefixDir changed since the last mount.
+  // the empack / runtime URLs changed since the last populate.
   const forceRemount =
     new URLSearchParams(self.location.search).get("remountRHome") === "1";
   await postToRWorker(worker, { type: RWASM.REMOUNT_R_HOME, force: forceRemount });
-
-  const transfer = files.map((f) => f.data.buffer as ArrayBuffer);
-  await postToRWorker(worker, { type: RWASM.WRITE_WEB_APP_FILES, files }, transfer);
 
   lucentInfo("[runApp] worker eval", RUN_WEB_APP_R);
   await postToRWorker(worker, {
@@ -564,8 +506,7 @@ export async function runApp(files: AppFile[]): Promise<number> {
 async function startShinyApp(): Promise<void> {
   await ensureHttpuvReady();
   const worker = await ensureRWorker();
-  const files = await loadAppFiles();
-  await runApp(files);
+  await runApp();
   // Remount / SW activate can drop the worker link after the first handshake.
   // Re-assert Comlink before warmup so GET /shiny/ does not race PORT_HANDOFF.
   comlinkConnected = false;

@@ -1,19 +1,22 @@
-import { HOST_PREFIX, WASM_R_HOME } from "./rwasm-constants";
-
 export interface LucentConfig {
-  /** Base URL where the r-httpuv transport assets (httpuv-web.js, shiny-socket.js, ...) are served. */
+  /** Base URL where Lucent-built httpuv transport assets (httpuv-web.js, shiny-socket.js, ...) are served. */
   transportBaseUrl: string;
   /**
    * URL of the httpuv service worker script. Defaults to `/httpuv-sw.js` at the
    * site root so registration works on hosts that cannot send
-   * `Service-Worker-Allowed` (e.g. GitHub Pages). The canonical copy still
-   * lives under the wasm prefix; the root file is a deploy-time/serve alias.
+   * `Service-Worker-Allowed` (e.g. GitHub Pages). That file is a deploy-time
+   * or serve-time alias of `lucent/dist/httpuv-sw.js`.
    */
   serviceWorkerUrl: string;
-  /** Base URL of the site root (_env-wasm-manifest.json and host prefix tree). */
+  /**
+   * Base URL for the Rmain bootstrap binaries (`bin/Rmain.js`, `bin/Rmain.wasm`).
+   * Trailing slash is normalized at use sites.
+   */
   rRuntimeBaseUrl: string;
-  /** Host directory name under rRuntimeBaseUrl where the wasm prefix tree is served. */
-  hostPrefixDir: string;
+  /** URL of `empack_env_meta.json` (packages + appended webApp archive). */
+  empackMetaUrl: string;
+  /** Base URL for empack package archives listed in the meta file. */
+  empackPackagesBaseUrl: string;
   /**
    * Base URL under which the virtual Shiny app is mounted; the mount prefix is
    * `<shinyBaseUrl>shiny/`. Defaults to the origin root ("/"), giving `/shiny/`.
@@ -21,23 +24,19 @@ export interface LucentConfig {
    * otherwise Shiny's asset URLs collide with the real bundle directory.
    */
   shinyBaseUrl: string;
-  /** Base URL of the Shiny app directory. Defaults to `webApp/` relative to the page. */
-  appDirUrl?: string;
-  /** URL of the app file manifest ({ files: string[] }). Defaults to `manifest.json` under appDirUrl. */
-  appManifestUrl?: string;
 }
 
-/** Default host directory for the wasm prefix tree under the site root. */
-export const DEFAULT_HOST_PREFIX_DIR = HOST_PREFIX;
+/** Default location of Lucent-built httpuv transport assets. */
+export const DEFAULT_TRANSPORT_BASE_URL = "/lucent/dist/";
 
-/** Default location of r-httpuv transport assets inside the wasm prefix. */
-export const DEFAULT_TRANSPORT_BASE_URL = `/${HOST_PREFIX}${WASM_R_HOME}/library/httpuv/www/`;
-
-/** Default SW script URL (site root; see LucentConfig.serviceWorkerUrl). */
+/** Default SW script URL (site root alias of lucent/dist/httpuv-sw.js). */
 export const DEFAULT_SERVICE_WORKER_URL = "/httpuv-sw.js";
 
-/** Default site root for the wasm prefix manifest and host tree. */
-export const DEFAULT_R_RUNTIME_BASE_URL = "/";
+/** Default base for Rmain.js / Rmain.wasm (`bin/` under this URL). */
+export const DEFAULT_R_RUNTIME_BASE_URL = "/runtime/";
+
+/** Default empack meta URL. */
+export const DEFAULT_EMPACK_META_URL = "/packages/empack_env_meta.json";
 
 /** Default base for the Shiny mount point (origin root → prefix `/shiny/`). */
 export const DEFAULT_SHINY_BASE_URL = "/";
@@ -75,6 +74,14 @@ function configOverridesFromUrl(): Partial<LucentConfig> {
   return {};
 }
 
+function resolveAgainstLocation(url: string): URL {
+  const base =
+    typeof self !== "undefined" && self.location?.href
+      ? self.location.href
+      : "http://localhost/";
+  return new URL(url, base);
+}
+
 /**
  * Resolve the runtime config, layering explicit overrides over a `?lucentConfig`
  * URL param (host → worker handoff) over a globalThis (`__LUCENT__`) config over
@@ -85,13 +92,17 @@ export function resolveLucentConfig(overrides: Partial<LucentConfig> = {}): Luce
   const fromUrl = configOverridesFromUrl();
   const pick = <K extends keyof LucentConfig>(key: K): LucentConfig[K] | undefined =>
     overrides[key] ?? fromUrl[key] ?? fromGlobal[key];
+
+  const empackMetaUrl = pick("empackMetaUrl") ?? DEFAULT_EMPACK_META_URL;
+  const empackPackagesBaseUrl =
+    pick("empackPackagesBaseUrl") ?? new URL(".", resolveAgainstLocation(empackMetaUrl)).href;
+
   return {
     transportBaseUrl: pick("transportBaseUrl") ?? DEFAULT_TRANSPORT_BASE_URL,
     serviceWorkerUrl: pick("serviceWorkerUrl") ?? DEFAULT_SERVICE_WORKER_URL,
     rRuntimeBaseUrl: pick("rRuntimeBaseUrl") ?? DEFAULT_R_RUNTIME_BASE_URL,
-    hostPrefixDir: pick("hostPrefixDir") ?? DEFAULT_HOST_PREFIX_DIR,
+    empackMetaUrl,
+    empackPackagesBaseUrl,
     shinyBaseUrl: pick("shinyBaseUrl") ?? DEFAULT_SHINY_BASE_URL,
-    appDirUrl: pick("appDirUrl"),
-    appManifestUrl: pick("appManifestUrl"),
   };
 }

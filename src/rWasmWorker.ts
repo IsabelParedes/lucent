@@ -7,9 +7,8 @@ import {
   initRModule,
   remountRHome,
   setEvalRPostFlush,
-  writeWebAppFilesToVfs,
+  type DownloadProgress,
   type RModule,
-  type WebAppFile,
 } from "./rWasmBootstrap";
 import { createHttpDelivery } from "./rWasmHttpDelivery";
 import { createRTaskQueue, SHINY_HOST } from "./rWasmTasks";
@@ -26,9 +25,8 @@ const workerSelf = self as unknown as DedicatedWorkerGlobalScope;
 const config = resolveLucentConfig();
 
 let rAssetBaseUrl: string | null = null;
-/** Last successfully mounted prefix identity (skip remount when unchanged). */
-let mountedAssetBaseUrl: string | null = null;
-let mountedHostPrefixDir: string | null = null;
+/** Last successfully populated empack identity (skip remount when unchanged). */
+let mountedRuntimeKey: string | null = null;
 let transport: HttpuvTransport | null = null;
 let rModule: RModule | null = null;
 let rModulePromise: Promise<RModule> | null = null;
@@ -306,20 +304,42 @@ function installBridge(t: HttpuvTransport): void {
   });
 }
 
+function empackMountKey(): string {
+  return [
+    config.rRuntimeBaseUrl,
+    config.empackMetaUrl,
+    config.empackPackagesBaseUrl,
+  ].join("\0");
+}
+
+function onDownloadProgress(progress: DownloadProgress): void {
+  const pct =
+    progress.percent == null ? "?" : `${progress.percent.toFixed(1)}%`;
+  lucentInfo(
+    `[rWasm] download ${pct} (${progress.downloadedBytes}/${progress.totalBytes})`,
+  );
+}
+
 async function initEverything(): Promise<RModule> {
   transport = await loadTransport(config.transportBaseUrl);
   http.setIdleMaxMs(transport.REQUEST_TIMEOUT_MS);
-  const assetBaseUrl = new URL(config.rRuntimeBaseUrl, self.location.href).href;
-  rAssetBaseUrl = assetBaseUrl;
+  const runtimeBaseUrl = new URL(config.rRuntimeBaseUrl, self.location.href).href;
+  const empackMetaUrl = new URL(config.empackMetaUrl, self.location.href).href;
+  const empackPackagesBaseUrl = new URL(
+    config.empackPackagesBaseUrl,
+    self.location.href,
+  ).href;
+  rAssetBaseUrl = runtimeBaseUrl;
   const module = await initRModule({
-    assetBaseUrl,
-    hostPrefixDir: config.hostPrefixDir,
+    runtimeBaseUrl,
+    empackMetaUrl,
+    empackPackagesBaseUrl,
     print: (text) => log("log", text),
     printErr: (text) => log("error", text),
+    onDownloadProgress,
   });
   rModule = module;
-  mountedAssetBaseUrl = assetBaseUrl;
-  mountedHostPrefixDir = config.hostPrefixDir;
+  mountedRuntimeKey = empackMountKey();
   installBridge(transport);
   return module;
 }
@@ -454,18 +474,6 @@ async function onMessage(event: MessageEvent): Promise<void> {
   }
 
   switch (data.type) {
-    case RWASM.WRITE_WEB_APP_FILES: {
-      try {
-        const module = await ensureRModule();
-        const files = Array.isArray(data.files) ? (data.files as WebAppFile[]) : [];
-        writeWebAppFilesToVfs(module, files);
-        replyOk(data.id);
-      } catch (err) {
-        replyErr(data.id, err);
-      }
-      break;
-    }
-
     case RWASM.EVAL: {
       try {
         const module = await ensureRModule();
@@ -488,22 +496,26 @@ async function onMessage(event: MessageEvent): Promise<void> {
       try {
         await ensureRModule();
         if (!rAssetBaseUrl) {
-          throw new Error("R asset base URL is not set");
+          throw new Error("R runtime base URL is not set");
         }
         const force = Boolean(data.force);
-        const prefix = config.hostPrefixDir;
-        if (
-          !force &&
-          mountedAssetBaseUrl === rAssetBaseUrl &&
-          mountedHostPrefixDir === prefix
-        ) {
-          lucentInfo("[rWasmWorker] remount skipped (prefix unchanged)");
+        const key = empackMountKey();
+        if (!force && mountedRuntimeKey === key) {
+          lucentInfo("[rWasmWorker] remount skipped (empack env unchanged)");
           replyOk(data.id);
           break;
         }
-        await remountRHome(requireRModule(), rAssetBaseUrl, prefix);
-        mountedAssetBaseUrl = rAssetBaseUrl;
-        mountedHostPrefixDir = prefix;
+        const empackMetaUrl = new URL(config.empackMetaUrl, self.location.href).href;
+        const empackPackagesBaseUrl = new URL(
+          config.empackPackagesBaseUrl,
+          self.location.href,
+        ).href;
+        await remountRHome(requireRModule(), {
+          empackMetaUrl,
+          empackPackagesBaseUrl,
+          onDownloadProgress,
+        });
+        mountedRuntimeKey = key;
         replyOk(data.id);
       } catch (err) {
         log("error", `[rWasmWorker] remount R_HOME failed: ${formatRWasmError(err)}`);

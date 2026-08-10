@@ -1,7 +1,9 @@
+import type { HttpuvModule } from "./httpuv/types";
+
 export {};
 
 declare global {
-  /** Set by shinyForge.enableHttpuvDebug() / ?httpuvDebug=1 */
+  /** Set by enableHttpuvDebug() / ?httpuvDebug=1 */
   // eslint-disable-next-line no-var
   var __HTTPUV_DEBUG__: boolean | undefined;
 
@@ -9,8 +11,16 @@ declare global {
   // eslint-disable-next-line no-var
   var Module:
     | {
-        httpuv?: unknown;
+        httpuv?: HttpuvModule;
         _rWasmEvalDepth?: number;
+        [key: string]: unknown;
+      }
+    | undefined;
+
+  // eslint-disable-next-line no-var
+  var Shiny:
+    | {
+        createSocket?: () => unknown;
         [key: string]: unknown;
       }
     | undefined;

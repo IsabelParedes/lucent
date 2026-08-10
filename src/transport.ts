@@ -69,9 +69,9 @@ export interface HttpuvBridgeOptions {
 }
 
 /**
- * The public surface of the r-httpuv transport (httpuv-web.js) that Lucent
- * consumes at runtime. Kept as a hand-written contract so Lucent stays
- * decoupled from the transport's build output.
+ * The public surface of httpuv-web.js that Lucent consumes at runtime.
+ * Kept as a hand-written contract so runApp/rWasmWorker stay decoupled from
+ * the transport bundle's build graph (loaded via dynamic import).
  */
 export interface HttpuvTransport {
   MSG: MsgTypes;
@@ -103,9 +103,10 @@ function transportUrl(baseUrl: string): string {
 }
 
 /**
- * Dynamically load the r-httpuv transport module (`httpuv-web.js`) served from
- * `baseUrl`. The result is cached; the specifier is a runtime value so the
- * bundler leaves it as a live `import()` instead of inlining the transport.
+ * Dynamically load the httpuv transport module (`httpuv-web.js`) served from
+ * `baseUrl` (typically Lucent dist). The result is cached; the specifier is a
+ * runtime value so the bundler leaves it as a live `import()` instead of
+ * inlining the transport.
  */
 export function loadTransport(baseUrl: string): Promise<HttpuvTransport> {
   if (!cached) {

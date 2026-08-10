@@ -1,10 +1,7 @@
-/** Host directory name under the site root where the wasm prefix is served. */
-export const HOST_PREFIX = "_env-wasm";
-
 /** R_HOME inside the mounted prefix (VFS root is /). */
 export const WASM_R_HOME = "/lib/R";
 
-/** App directory inside the R VFS (written by Lucent before startApp). */
+/** App directory inside the R VFS (populated via empack pack dir + append). */
 export const WEB_APP_DIR = "/webApp";
 
 /** Message types between the main page and the R.wasm dedicated worker. */
@@ -12,7 +9,6 @@ export const RWASM = {
   READY: "rwasm_ready",
   EVAL: "rwasm_eval",
   EVAL_RESULT: "rwasm_eval_result",
-  WRITE_WEB_APP_FILES: "rwasm_write_web_app_files",
   STOP_APP: "rwasm_stop_app",
   REMOUNT_R_HOME: "rwasm_remount_r_home",
   STOPPED: "rwasm_stopped",
