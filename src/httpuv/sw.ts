@@ -21,6 +21,7 @@ import {
   tryGetHostPrefixDir,
 } from "./prefix";
 import { resolveShinyStaticRHomePath, rHomeAssetHttpPath, rHomePathFromVfsDir } from "./static-resolve";
+import { maybePatchAppDocumentResponse } from "./htmlwidget-deps-patch";
 import type { HeaderMap, PendingResponse } from "./types";
 
 // `self` is typed as Window because the DOM lib is enabled for the other
@@ -724,11 +725,16 @@ function handleHostOutboundMessage(msg: HostOutbound): void {
       }
       clearTimeout(pending.timer);
       pendingHttp.delete(msg.uuid);
-      const resp: PendingResponse = {
-        status: msg.status ?? 500,
-        headers: msg.headers ?? {},
-        body: msg.body ?? null,
-      };
+      const resp: PendingResponse = maybePatchAppDocumentResponse(
+        {
+          status: msg.status ?? 500,
+          headers: msg.headers ?? {},
+          body: msg.body ?? null,
+        },
+        pending.url,
+        pending.method,
+        isAppDocumentRequest,
+      );
       maybeCacheAppDocument(resp, pending.url, pending.method);
       pending.resolve(resp);
       break;

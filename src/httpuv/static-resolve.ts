@@ -45,6 +45,22 @@ const SHINY_STATIC_BASES: StaticBaseRule[] = [
  * Returns a path relative to R_HOME/ (no leading slash), or null.
  */
 function resolveKnownAsset(prefix: string, suffix: string): string | null {
+  if (prefix.startsWith("jquery-3.5")) {
+    return `library/crosstalk/lib/jquery/${basename(suffix)}`;
+  }
+  if (prefix.startsWith("crosstalk-")) {
+    return `library/crosstalk/www/${suffix}`.replace(/\/+/g, "/");
+  }
+  if (prefix.startsWith("plotly-binding-")) {
+    return `library/plotly/htmlwidgets/${suffix}`.replace(/\/+/g, "/");
+  }
+  if (prefix.startsWith("typedarray-")) {
+    return `library/plotly/htmlwidgets/lib/typedarray/${suffix}`.replace(/\/+/g, "/");
+  }
+  if (prefix.startsWith("plotly-main-") || prefix.startsWith("plotly-htmlwidgets-css-")) {
+    return `library/plotly/htmlwidgets/lib/plotlyjs/${suffix}`.replace(/\/+/g, "/");
+  }
+
   if (prefix.startsWith("bootstrap-5")) {
     if (suffix.endsWith(".js")) {
       return `library/bslib/lib/bs5/dist/js/${basename(suffix)}`;
