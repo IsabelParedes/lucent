@@ -28,6 +28,7 @@ export interface RHostApi {
   deliverHttpRequest(req: unknown): Promise<void>;
   getShinyResourcePaths(): Promise<Record<string, string>>;
   readVfsFile(vfsDir: string, suffix: string): Promise<ArrayBuffer | null>;
+  readVfsFileAt(vfsPath: string): Promise<ArrayBuffer | null>;
   stop(): void | Promise<void>;
 }
 

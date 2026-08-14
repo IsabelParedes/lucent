@@ -17,10 +17,7 @@ import {
   parseSessionAction,
   resolveSessionPrefix,
   resolveShinyPrefix,
-  setHostPrefixDir,
-  tryGetHostPrefixDir,
 } from "./prefix";
-import { resolveShinyStaticRHomePath, rHomeAssetHttpPath, rHomePathFromVfsDir } from "./static-resolve";
 import { maybePatchAppDocumentResponse } from "./htmlwidget-deps-patch";
 import type { HeaderMap, PendingResponse } from "./types";
 
@@ -34,8 +31,6 @@ const swSelf = self as unknown as ServiceWorkerGlobalScope;
  * deriving the Shiny prefix from import.meta.url is wrong. Prefer an explicit
  * `?shinyPrefix=` on the registration URL; otherwise default to the origin
  * root, giving `/shiny/`. The host also confirms this via REGISTER_HOST.
- * Optional `?hostPrefix=` names a host directory for HTTP-served R static
- * assets when VFS delivery is unavailable (legacy).
  */
 function initialShinyPrefix(): string {
   try {
@@ -48,24 +43,6 @@ function initialShinyPrefix(): string {
     // fall through to origin-root default
   }
   return resolveShinyPrefix(new URL("/", swSelf.location.href).href);
-}
-
-function initialHostPrefixDir(): string | null {
-  try {
-    const own = new URL(swSelf.location.href);
-    const declared = own.searchParams.get("hostPrefix");
-    if (declared) {
-      return declared.replace(/^\/+|\/+$/g, "");
-    }
-  } catch {
-    // fall through
-  }
-  return null;
-}
-
-const declaredHostPrefixDir = initialHostPrefixDir();
-if (declaredHostPrefixDir) {
-  setHostPrefixDir(declaredHostPrefixDir);
 }
 
 const SHINY_PREFIX = initialShinyPrefix();
@@ -241,7 +218,7 @@ const sessionPortReregisterPending = new Set<string>();
 /** Cached GET /shiny/ document so warmup and iframe do not each trigger a full R render. */
 let cachedAppDocument: PendingResponse | null = null;
 
-/** addResourcePath prefix -> VFS directory (e.g. jquery-3.7.1 -> /lib/R/library/shiny/www/shared). */
+/** addResourcePath prefix -> VFS directory (e.g. shiny-plots -> /tmp/shiny-plots). */
 let shinyResourcePaths = new Map<string, string>();
 
 function isAppDocumentRequest(urlString: string): boolean {
@@ -294,6 +271,22 @@ function setShinyResourcePaths(paths: Record<string, string>): void {
   }
 }
 
+function updateShinyResourcePath(prefix: string, dir: string | undefined): void {
+  if (!prefix) {
+    return;
+  }
+  if (!dir) {
+    shinyResourcePaths.delete(prefix);
+  } else {
+    shinyResourcePaths.set(prefix, dir);
+  }
+  httpuvDebugLog("sw-resource-path-update", {
+    prefix,
+    dir: dir || null,
+    count: shinyResourcePaths.size,
+  });
+}
+
 function mimeForAssetSuffix(suffix: string): string {
   if (suffix.endsWith(".js") || suffix.endsWith(".mjs")) {
     return "application/javascript";
@@ -316,40 +309,88 @@ function mimeForAssetSuffix(suffix: string): string {
   return "application/octet-stream";
 }
 
-/** Site root for static R_HOME assets. Prefer the SW registration scope so
- * project GitHub Pages mounts (`/repo/`) resolve to `/repo/_env-wasm/...`
- * instead of origin-absolute `/_env-wasm/...`. */
-function siteRootUrl(fallbackOrigin: URL): URL {
-  const scope = swSelf.registration?.scope;
-  if (scope) {
-    return new URL(scope);
+/** Pathname relative to the SW registration scope (`/` or `/repo/` on Pages). */
+function pathnameRelativeToScope(pathname: string): string {
+  const scopeUrl = swSelf.registration?.scope;
+  if (!scopeUrl) {
+    return pathname;
   }
-  return new URL("/", fallbackOrigin.origin);
+  let scopePath = new URL(scopeUrl).pathname;
+  if (!scopePath.endsWith("/")) {
+    scopePath += "/";
+  }
+  if (scopePath !== "/" && pathname.startsWith(scopePath)) {
+    return `/${pathname.slice(scopePath.length)}`;
+  }
+  return pathname;
 }
 
-async function fetchRHomeAsset(rHomeRelative: string, requestUrl: URL): Promise<Response | null> {
-  const hostPrefixDir = tryGetHostPrefixDir();
-  if (!hostPrefixDir) {
-    httpuvDebugLog("sw-static-miss", {
-      path: rHomeRelative,
-      reason: "hostPrefix not configured",
-    });
+/**
+ * Map a request pathname to an absolute VFS path under `/lib/R/`.
+ * Must be the R_HOME mount (`/lib/R/...` or `/repo/lib/R/...`), not a substring
+ * of `/runtime/lib/R/...` (Rmain SIDE_MODULEs loaded during boot).
+ */
+function vfsPathFromLibRRequest(pathname: string): string | null {
+  const rest = pathnameRelativeToScope(pathname);
+  const marker = `${WASM_R_HOME}/`;
+  if (rest !== WASM_R_HOME && !rest.startsWith(marker)) {
     return null;
   }
-  const assetUrl = new URL(rHomeAssetHttpPath(hostPrefixDir, rHomeRelative), siteRootUrl(requestUrl));
-  const assetRes = await fetch(assetUrl, { cache: "force-cache" });
-  if (!assetRes.ok) {
-    httpuvDebugLog("sw-static-miss", {
-      path: rHomeRelative,
-      status: assetRes.status,
-      url: assetUrl.href,
-    });
+  if (rest.includes("..")) {
     return null;
   }
-  return assetRes;
+  return rest;
 }
 
-/** Serve Shiny web dependencies from the preloaded wasm prefix (no R eval). */
+function vfsStaticResponse(
+  body: ArrayBuffer,
+  suffix: string,
+  source: string,
+  method: string,
+): Response {
+  const headers = new Headers({
+    "Content-Type": mimeForAssetSuffix(suffix),
+    "X-Httpuv-Static": source,
+  });
+  if (method === "HEAD") {
+    return new Response(null, { status: 200, headers });
+  }
+  return new Response(body, { status: 200, headers });
+}
+
+/** Serve files under `/lib/R/**` directly from the wasm VFS. */
+async function tryServeLibRAsset(request: Request): Promise<Response | null> {
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    return null;
+  }
+
+  const url = new URL(request.url);
+  const vfsPath = vfsPathFromLibRRequest(url.pathname);
+  if (!vfsPath) {
+    return null;
+  }
+
+  const suffix = vfsPath.slice(vfsPath.lastIndexOf("/") + 1);
+
+  try {
+    if (!rwasmHost) {
+      void requestComlinkFromHost();
+    }
+    const host = await waitForRwasmHost();
+    const body = await host.readVfsFileAt(vfsPath);
+    if (!body) {
+      httpuvDebugLog("sw-vfs-read-miss", { vfsPath });
+      return null;
+    }
+    httpuvDebugLog("sw-static-hit", { vfsPath, source: "lib-r-vfs" });
+    return vfsStaticResponse(body, suffix, "lib-r-vfs", request.method);
+  } catch (err) {
+    httpuvDebugLog("sw-vfs-read-fail", { vfsPath, err: String(err) });
+    return null;
+  }
+}
+
+/** Serve `/shiny/{prefix}/{suffix}` from synced resourcePaths() VFS dirs. */
 async function tryServeShinyStaticAsset(request: Request): Promise<Response | null> {
   if (request.method !== "GET" && request.method !== "HEAD") {
     return null;
@@ -372,67 +413,23 @@ async function tryServeShinyStaticAsset(request: Request): Promise<Response | nu
     return null;
   }
 
-  const toStaticResponse = (
-    assetRes: Response,
-    source: string,
-  ): Response => {
-    const headers = new Headers(assetRes.headers);
-    if (!headers.has("Content-Type")) {
-      headers.set("Content-Type", mimeForAssetSuffix(suffix));
-    }
-    headers.set("X-Httpuv-Static", source);
-    if (request.method === "HEAD") {
-      return new Response(null, { status: 200, headers });
-    }
-    return new Response(assetRes.body, { status: 200, headers });
-  };
-
-  // 1. Known R library layout (bootstrap JS, bslib components, jquery, …).
-  const fallbackPath = resolveShinyStaticRHomePath(prefix, suffix);
-  if (fallbackPath) {
-    const assetRes = await fetchRHomeAsset(fallbackPath, url);
-    if (assetRes) {
-      httpuvDebugLog("sw-static-hit", { prefix, suffix, source: "rhome-fallback", path: fallbackPath });
-      return toStaticResponse(assetRes, "rhome-fallback");
-    }
-  }
-
-  // 2. Synced shiny::resourcePaths() directories.
   const localDir = shinyResourcePaths.get(prefix);
-  if (localDir) {
-    if (localDir.startsWith(`${WASM_R_HOME}/`)) {
-      const rHomeRelative = rHomePathFromVfsDir(localDir, suffix);
-      if (rHomeRelative) {
-        const assetRes = await fetchRHomeAsset(rHomeRelative, url);
-        if (assetRes) {
-          httpuvDebugLog("sw-static-hit", { prefix, suffix, source: "rhome", path: rHomeRelative });
-          return toStaticResponse(assetRes, "rhome");
-        }
-      }
-    } else {
-      // Runtime bslib/sass cache (not under /lib/R/): read from Emscripten VFS
-      // via the worker without an R eval (avoids WASM traps on large base64 JSON).
-      try {
-        const host = await waitForRwasmHost();
-        const body = await host.readVfsFile(localDir, suffix);
-        if (body) {
-          httpuvDebugLog("sw-static-hit", { prefix, suffix, source: "vfs", path: localDir });
-          const headers = new Headers({
-            "Content-Type": mimeForAssetSuffix(suffix),
-            "X-Httpuv-Static": "vfs",
-          });
-          if (request.method === "HEAD") {
-            return new Response(null, { status: 200, headers });
-          }
-          return new Response(body, { status: 200, headers });
-        }
-      } catch (err) {
-        httpuvDebugLog("sw-vfs-read-fail", { prefix, suffix, vfsDir: localDir, err: String(err) });
-      }
-    }
+  if (!localDir || !rwasmHost) {
+    return null;
   }
 
-  return null;
+  try {
+    const body = await rwasmHost.readVfsFile(localDir, suffix);
+    if (!body) {
+      httpuvDebugLog("sw-vfs-read-miss", { prefix, suffix, vfsDir: localDir });
+      return null;
+    }
+    httpuvDebugLog("sw-static-hit", { prefix, suffix, source: "vfs", path: localDir });
+    return vfsStaticResponse(body, suffix, "vfs", request.method);
+  } catch (err) {
+    httpuvDebugLog("sw-vfs-read-fail", { prefix, suffix, vfsDir: localDir, err: String(err) });
+    return null;
+  }
 }
 
 swSelf.addEventListener("install", (event) => {
@@ -852,6 +849,22 @@ async function handleShinyFetch(event: FetchEvent): Promise<Response> {
 
 swSelf.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
+
+  if (event.request.method === "GET" || event.request.method === "HEAD") {
+    if (vfsPathFromLibRRequest(url.pathname)) {
+      event.respondWith(
+        (async () => {
+          if (!rwasmHost) {
+            void requestComlinkFromHost();
+          }
+          const served = await tryServeLibRAsset(event.request);
+          return served ?? new Response("Not Found", { status: 404 });
+        })(),
+      );
+      return;
+    }
+  }
+
   if (!pathUnderShinyPrefix(url.pathname)) {
     return;
   }
@@ -920,9 +933,6 @@ swSelf.addEventListener("message", (event) => {
       if (typeof msg.shinyPrefix === "string" && msg.shinyPrefix) {
         shinyAppPrefix = msg.shinyPrefix.endsWith("/") ? msg.shinyPrefix : `${msg.shinyPrefix}/`;
       }
-      if (typeof msg.hostPrefix === "string" && msg.hostPrefix) {
-        setHostPrefixDir(msg.hostPrefix);
-      }
       const source = event.source;
       if (source && "id" in source) {
         hostClientId = source.id;
@@ -947,30 +957,13 @@ swSelf.addEventListener("message", (event) => {
       break;
     }
 
-    case MSG.SYNC_RESOURCE_PATHS: {
-      const replyPort = event.ports?.[0] ?? null;
-      const finish = () => {
-        replyPort?.postMessage({ ok: true });
-      };
-      if (!rwasmHost) {
-        console.warn("[httpuv-sw] SYNC_RESOURCE_PATHS: R worker not connected");
-        finish();
-        break;
-      }
-      void rwasmHost
-        .getShinyResourcePaths()
-        .then((paths) => {
-          setShinyResourcePaths(paths);
-        })
-        .catch((err: unknown) => {
-          console.warn("[httpuv-sw] failed to sync resource paths", err);
-        })
-        .finally(finish);
+    case MSG.REGISTER_RESOURCE_PATHS: {
+      setShinyResourcePaths(msg.paths);
       break;
     }
 
-    case MSG.REGISTER_RESOURCE_PATHS: {
-      setShinyResourcePaths(msg.paths);
+    case MSG.UPDATE_RESOURCE_PATH: {
+      updateShinyResourcePath(String(msg.prefix ?? ""), msg.dir == null ? "" : String(msg.dir));
       break;
     }
 

@@ -1,7 +1,43 @@
 import type { PendingResponse } from "./types";
 
-/** Inline script: patch Shiny outputBindings.register before htmlwidget bindings load. */
-const HTMLWIDGET_ASYNC_DEPS_PATCH = `<script id="lucent-htmlwidget-async-deps">(function(){function install(){if(!window.Shiny||!Shiny.outputBindings||!Shiny.renderDependenciesAsync)return;if(Shiny.outputBindings.__lucentAsyncDeps)return;Shiny.outputBindings.__lucentAsyncDeps=1;var reg=Shiny.outputBindings.register.bind(Shiny.outputBindings);Shiny.outputBindings.register=function(binding,name){if(binding&&binding.renderValue){var rv=binding.renderValue.bind(binding);binding.renderValue=function(el,data){if(data&&data.deps){Shiny.renderDependenciesAsync(data.deps).then(function(){rv(el,data);});return;}rv(el,data);};}return reg(binding,name);};}install();var n=0,t=setInterval(function(){install();if(++n>200)clearInterval(t);},5);})();</script>`;
+/**
+ * Stock htmlwidgets calls Shiny.renderDependencies() then renderValue immediately.
+ * That path jQuery-appends <script> tags, which uses sync XHR (jQuery._evalUrl).
+ * Chromium service workers do not intercept sync XHR, so /lib/R/** JS 404s on
+ * the HTTP server. renderDependenciesAsync uses document.head.append instead.
+ *
+ * The patch must also wrap bindings that already registered (plotly.js is not
+ * named *-binding, so injecting at </head> is too late).
+ */
+const HTMLWIDGET_ASYNC_DEPS_PATCH = `<script id="lucent-htmlwidget-async-deps">(function(){
+function wrap(binding){
+  if(!binding||!binding.renderValue||binding.__lucentAsyncDeps)return;
+  binding.__lucentAsyncDeps=1;
+  var rv=binding.renderValue.bind(binding);
+  binding.renderValue=function(el,data){
+    if(data&&data.deps){
+      Shiny.renderDependenciesAsync(data.deps).then(function(){rv(el,data);});
+      return;
+    }
+    rv(el,data);
+  };
+}
+function install(){
+  if(!window.Shiny||!Shiny.outputBindings||!Shiny.renderDependenciesAsync)return;
+  if(!Shiny.outputBindings.__lucentAsyncDepsReg){
+    Shiny.outputBindings.__lucentAsyncDepsReg=1;
+    var reg=Shiny.outputBindings.register.bind(Shiny.outputBindings);
+    Shiny.outputBindings.register=function(binding,name){
+      wrap(binding);
+      return reg(binding,name);
+    };
+  }
+  var list=Shiny.outputBindings.getBindings?Shiny.outputBindings.getBindings():[];
+  for(var i=0;i<list.length;i++) wrap(list[i].binding);
+}
+install();
+var n=0,t=setInterval(function(){install();if(++n>200)clearInterval(t);},5);
+})();</script>`;
 
 function responseBodyToText(body: PendingResponse["body"]): string | null {
   if (body == null) {
@@ -31,9 +67,12 @@ export function injectHtmlwidgetAsyncDepsPatch(html: string): string {
   if (html.includes('id="lucent-htmlwidget-async-deps"')) {
     return html;
   }
-  const bindingScript = html.match(/<script src="[^"]*-binding[^"]*"><\/script>/);
-  if (bindingScript) {
-    return html.replace(bindingScript[0], `${HTMLWIDGET_ASYNC_DEPS_PATCH}\n${bindingScript[0]}`);
+  const shinyScript = html.match(/<script src="[^"]*\/shiny(?:\.min)?\.js"><\/script>/);
+  if (shinyScript) {
+    return html.replace(shinyScript[0], `${shinyScript[0]}\n${HTMLWIDGET_ASYNC_DEPS_PATCH}`);
+  }
+  if (html.includes("<head>")) {
+    return html.replace("<head>", `<head>\n${HTMLWIDGET_ASYNC_DEPS_PATCH}`);
   }
   if (html.includes("</head>")) {
     return html.replace("</head>", `${HTMLWIDGET_ASYNC_DEPS_PATCH}\n</head>`);

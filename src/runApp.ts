@@ -189,7 +189,7 @@ function controllerMatchesExpectedScript(): boolean {
   return current === expected;
 }
 
-/** Drop httpuv-sw registrations from an older script URL (e.g. pre-_env-wasm). */
+/** Drop httpuv-sw registrations from an older script URL. */
 async function cleanupStaleHttpuvServiceWorkers(): Promise<void> {
   const expected = serviceWorkerScriptPath();
   for (const reg of await navigator.serviceWorker.getRegistrations()) {
@@ -413,7 +413,9 @@ async function ensureRWorker(): Promise<Worker> {
     rWorkerPromise = createRWorker().then((worker) => {
       rWorker = worker;
       if (!serviceDriver) {
-        serviceDriver = createServiceDriver();
+        serviceDriver = createServiceDriver({
+          onHadWork: scheduleDebouncedResourcePathSync,
+        });
       }
       serviceDriver.attach(worker);
       return worker;
@@ -482,9 +484,31 @@ function loadViewerFrame(): void {
 }
 
 function clearAppDocumentCache(): void {
+  lastResourcePaths = {};
   navigator.serviceWorker.controller?.postMessage({
     type: requireTransport().MSG.CLEAR_APP_CACHE,
   });
+}
+
+const RESOURCE_PATH_SYNC_DEBOUNCE_MS = 100;
+let resourcePathSyncTimer: ReturnType<typeof setTimeout> | null = null;
+let lastResourcePaths: Record<string, string> = {};
+let resourcePathSyncInFlight = false;
+
+function scheduleDebouncedResourcePathSync(): void {
+  if (resourcePathSyncTimer) {
+    clearTimeout(resourcePathSyncTimer);
+  }
+  resourcePathSyncTimer = setTimeout(() => {
+    resourcePathSyncTimer = null;
+    if (rWorker) {
+      void syncResourcePathsIncremental(rWorker);
+    }
+  }, RESOURCE_PATH_SYNC_DEBOUNCE_MS);
+}
+
+function rememberResourcePaths(paths: Record<string, string>): void {
+  lastResourcePaths = { ...paths };
 }
 
 async function syncResourcePathsToServiceWorker(worker: Worker): Promise<void> {
@@ -496,12 +520,53 @@ async function syncResourcePathsToServiceWorker(worker: Worker): Promise<void> {
   try {
     const data = await postToRWorker(worker, { type: RWASM.GET_RESOURCE_PATHS });
     const paths = data.paths ?? {};
+    rememberResourcePaths(paths);
     controller.postMessage({ type: requireTransport().MSG.REGISTER_RESOURCE_PATHS, paths });
     if (Object.keys(paths).length > 0) {
       lucentInfo("[runApp] synced", Object.keys(paths).length, "resource path(s) to SW");
     }
   } catch (err) {
-    console.warn("[runApp] resource path sync failed; SW will use static fallbacks", err);
+    console.warn("[runApp] resource path sync failed; SW will fall through to R", err);
+  }
+}
+
+/** Diff resourcePaths() against the last SW snapshot and send incremental updates. */
+async function syncResourcePathsIncremental(worker: Worker): Promise<void> {
+  if (resourcePathSyncInFlight) {
+    scheduleDebouncedResourcePathSync();
+    return;
+  }
+  const controller = navigator.serviceWorker.controller;
+  if (!controller) {
+    return;
+  }
+
+  resourcePathSyncInFlight = true;
+  try {
+    const data = await postToRWorker(worker, { type: RWASM.GET_RESOURCE_PATHS });
+    const paths = data.paths ?? {};
+    const updateType = requireTransport().MSG.UPDATE_RESOURCE_PATH;
+    let changed = 0;
+    for (const prefix of Object.keys(paths)) {
+      if (lastResourcePaths[prefix] !== paths[prefix]) {
+        controller.postMessage({ type: updateType, prefix, dir: paths[prefix] });
+        changed += 1;
+      }
+    }
+    for (const prefix of Object.keys(lastResourcePaths)) {
+      if (!(prefix in paths)) {
+        controller.postMessage({ type: updateType, prefix, dir: "" });
+        changed += 1;
+      }
+    }
+    rememberResourcePaths(paths);
+    if (changed > 0) {
+      lucentInfo("[runApp] updated", changed, "resource path(s) on SW");
+    }
+  } catch (err) {
+    console.warn("[runApp] incremental resource path sync failed", err);
+  } finally {
+    resourcePathSyncInFlight = false;
   }
 }
 

@@ -19,10 +19,10 @@ export const MSG = {
   STOP: "httpuv_stop",
   /** Drop cached GET /shiny/ without tearing down the R worker (app restart). */
   CLEAR_APP_CACHE: "httpuv_clear_app_cache",
-  /** Ask the SW to refresh shiny::resourcePaths() from the R worker. */
-  SYNC_RESOURCE_PATHS: "httpuv_sync_resource_paths",
-  /** R worker -> SW mapping of addResourcePath prefixes to VFS directories. */
+  /** Host -> SW: full shiny::resourcePaths() map (warmup). */
   REGISTER_RESOURCE_PATHS: "httpuv_register_resource_paths",
+  /** Host -> SW: upsert or remove one addResourcePath prefix (empty dir removes). */
+  UPDATE_RESOURCE_PATH: "httpuv_update_resource_path",
   /** SW -> host: Comlink to the R worker was lost (e.g. after SW update). */
   REQUEST_COMLINK: "httpuv_request_comlink",
   /** Iframe → SW: transfer a MessagePort for session WS push delivery. */

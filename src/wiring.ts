@@ -28,6 +28,7 @@ export interface RHostHandlers {
   getResourcePaths: () => Promise<Record<string, string>>;
   registerSwDelivery: (port: MessagePort) => void;
   readVfsFile: (vfsDir: string, suffix: string) => Promise<ArrayBuffer | null>;
+  readVfsFileAt: (vfsPath: string) => Promise<ArrayBuffer | null>;
 }
 
 /** API the R worker exposes to the service worker (Comlink target). */
@@ -36,6 +37,7 @@ export interface RHostApi {
   deliverHttpRequest(req: HostHttpRequest): void | Promise<void>;
   getShinyResourcePaths(): Promise<Record<string, string>>;
   readVfsFile(vfsDir: string, suffix: string): Promise<ArrayBuffer | null>;
+  readVfsFileAt(vfsPath: string): Promise<ArrayBuffer | null>;
   stop(): void | Promise<void>;
 }
 
@@ -100,7 +102,8 @@ function waitForComlinkReady(rWorker: Worker): Promise<void> {
  * @param httpRequestType transport MSG.HTTP_REQUEST message type
  */
 export function createRHostApi(httpRequestType: string, handlers: RHostHandlers): RHostApi {
-  const { onHttpRequest, onStop, getResourcePaths, registerSwDelivery, readVfsFile } = handlers;
+  const { onHttpRequest, onStop, getResourcePaths, registerSwDelivery, readVfsFile, readVfsFileAt } =
+    handlers;
   return {
     registerSwDelivery(port: MessagePort) {
       registerSwDelivery(port);
@@ -121,6 +124,9 @@ export function createRHostApi(httpRequestType: string, handlers: RHostHandlers)
     },
     readVfsFile(vfsDir: string, suffix: string) {
       return readVfsFile(vfsDir, suffix);
+    },
+    readVfsFileAt(vfsPath: string) {
+      return readVfsFileAt(vfsPath);
     },
     stop() {
       onStop();

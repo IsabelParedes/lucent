@@ -1,28 +1,4 @@
 let shinyPrefix: string | null = null;
-let hostPrefixDir: string | null = null;
-
-function normalizeHostPrefixDir(prefix: string): string {
-  return prefix.replace(/^\/+|\/+$/g, "");
-}
-
-/**
- * Host directory name under the site root for optional HTTP-served R assets
- * (legacy fallback when VFS delivery is unavailable). Configured by the host.
- */
-export function setHostPrefixDir(prefix: string): void {
-  hostPrefixDir = normalizeHostPrefixDir(prefix);
-}
-
-export function getHostPrefixDir(): string {
-  if (!hostPrefixDir) {
-    throw new Error("Host prefix directory not initialized");
-  }
-  return hostPrefixDir;
-}
-
-export function tryGetHostPrefixDir(): string | null {
-  return hostPrefixDir;
-}
 
 /**
  * Resolve the virtual Shiny app prefix from a module script URL.

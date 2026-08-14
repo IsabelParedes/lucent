@@ -8,6 +8,7 @@ export interface MsgTypes {
   STOP: string;
   CLEAR_APP_CACHE: string;
   REGISTER_RESOURCE_PATHS: string;
+  UPDATE_RESOURCE_PATH: string;
   REQUEST_COMLINK: string;
   REGISTER_SESSION: string;
   SESSION_ACK: string;

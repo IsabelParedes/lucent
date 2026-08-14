@@ -11,6 +11,11 @@ export type ServiceDriver = {
   stop: () => void;
 };
 
+export type ServiceDriverOptions = {
+  /** Called when a SERVICE_TICK reported reactive/HTTP work. */
+  onHadWork?: () => void;
+};
+
 type ServiceStatusMessage = {
   type: typeof RWASM.SERVICE_STATUS;
   hadWork?: boolean;
@@ -35,7 +40,7 @@ type ScheduleDelayMessage = {
  * inside the Shiny iframe. requestAnimationFrame only coalesces visible work
  * (it pauses when the tab is hidden).
  */
-export function createServiceDriver(): ServiceDriver {
+export function createServiceDriver(options: ServiceDriverOptions = {}): ServiceDriver {
   let worker: Worker | null = null;
   let rafPending = false;
   let rafId = 0;
@@ -200,6 +205,9 @@ export function createServiceDriver(): ServiceDriver {
         return;
       }
       if (hadWork || wakeQueued) {
+        if (hadWork) {
+          options.onHadWork?.();
+        }
         wakeQueued = false;
         scheduleFollowUp();
         return;

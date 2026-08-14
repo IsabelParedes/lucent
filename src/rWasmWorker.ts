@@ -369,26 +369,37 @@ function ensureRModule(): Promise<RModule> {
   return rModulePromise;
 }
 
+function readVfsFileAt(vfsPath: string): ArrayBuffer | null {
+  const module = requireRModule();
+  const path = vfsPath.replace(/\/+$/, "");
+  if (!path.startsWith("/") || path.includes("..")) {
+    return null;
+  }
+  try {
+    const data = module.FS.readFile(path, { encoding: "binary" });
+    return data.buffer.slice(
+      data.byteOffset,
+      data.byteOffset + data.byteLength,
+    ) as ArrayBuffer;
+  } catch (err) {
+    log("error", `[rWasmWorker] readVfsFileAt failed ${path}: ${formatRWasmError(err)}`);
+    return null;
+  }
+}
+
 function readVfsFile(vfsDir: string, suffix: string): Promise<ArrayBuffer | null> {
   return ensureRModule().then(() => {
-    const module = requireRModule();
     const rel = suffix.replace(/^\/+/, "");
     if (!rel || rel.includes("..")) {
       return null;
     }
     const path = `${vfsDir.replace(/\/$/, "")}/${rel}`;
-    try {
-      const data = module.FS.readFile(path, { encoding: "binary" });
-      const buf = data.buffer.slice(
-        data.byteOffset,
-        data.byteOffset + data.byteLength,
-      ) as ArrayBuffer;
-      return buf;
-    } catch (err) {
-      log("error", `[rWasmWorker] readVfsFile failed ${path}: ${formatRWasmError(err)}`);
-      return null;
-    }
+    return readVfsFileAt(path);
   });
+}
+
+function readVfsFileAtAsync(vfsPath: string): Promise<ArrayBuffer | null> {
+  return ensureRModule().then(() => readVfsFileAt(vfsPath));
 }
 
 function readShinyResourcePathsFromR(): Record<string, string> {
@@ -446,6 +457,7 @@ function exposeRHost(port: MessagePort): void {
     },
     getResourcePaths: () => getShinyResourcePaths(),
     readVfsFile: (vfsDir, suffix) => readVfsFile(vfsDir, suffix),
+    readVfsFileAt: (vfsPath) => readVfsFileAtAsync(vfsPath),
     registerSwDelivery: (deliveryPort) => {
       connectSwDelivery(deliveryPort);
     },
