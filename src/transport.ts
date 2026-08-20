@@ -29,7 +29,9 @@ export interface ChannelTypes {
 
 export interface ComlinkTypes {
   PORT_HANDOFF: string;
-  [key: string]: string;
+  /** Absent on transport bundles built before the handoff ack was added. */
+  PORT_HANDOFF_ACK?: string;
+  [key: string]: string | undefined;
 }
 
 /** Loose shape of a channel message pushed into R (buildReq / WS frames). */
