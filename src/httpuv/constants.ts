@@ -58,4 +58,10 @@ export const HTTPUV_OPTIONS = {
 /** Comlink MessagePort handshake between host page, service worker, and R worker. */
 export const COMLINK = {
   PORT_HANDOFF: "httpuv_comlink_port",
+  /**
+   * SW -> host: the handoff port arrived. Sent before the Comlink round-trip so
+   * the host can distinguish a dropped handoff (worker evicted mid-boot) from an
+   * R worker that never finished setup.
+   */
+  PORT_HANDOFF_ACK: "httpuv_comlink_port_ack",
 } as const;
