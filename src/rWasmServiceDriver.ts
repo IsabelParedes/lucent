@@ -241,6 +241,12 @@ export function createServiceDriver(options: ServiceDriverOptions = {}): Service
     }
   }
 
+  /**
+   * Attaching does not tick. A tick is a synchronous R call, and until the app
+   * is started there is nothing to service, so the first tick is left to R
+   * (NEED_SERVICE) or to the explicit wake() after startApp. Ticking on attach
+   * put a long R call in front of the boot-time Comlink handshake.
+   */
   function attach(next: Worker): void {
     if (worker === next && !stopped) {
       return;
@@ -250,7 +256,6 @@ export function createServiceDriver(options: ServiceDriverOptions = {}): Service
     stopped = false;
     worker.addEventListener("message", onWorkerMessage);
     document.addEventListener("visibilitychange", onVisibilityChange);
-    scheduleFollowUp();
   }
 
   function stop(): void {
