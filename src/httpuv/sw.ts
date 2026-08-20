@@ -888,6 +888,23 @@ swSelf.addEventListener("fetch", (event) => {
   event.respondWith(handleShinyFetch(event));
 });
 
+/** Reply to whoever sent `event` (window client, worker, or port). */
+function replyToMessageSource(
+  event: ExtendableMessageEvent,
+  msg: Record<string, unknown>,
+): void {
+  const source = event.source;
+  if (!source) {
+    httpuvDebugLog("sw-reply-no-source", { type: msg.type });
+    return;
+  }
+  try {
+    source.postMessage(msg);
+  } catch (err) {
+    httpuvDebugLog("sw-reply-failed", { type: msg.type, err: String(err) });
+  }
+}
+
 swSelf.addEventListener("message", (event) => {
   const msg = event.data;
   if (msg === "skipWaiting" || msg?.type === "SKIP_WAITING") {
@@ -901,6 +918,11 @@ swSelf.addEventListener("message", (event) => {
   if (msg.type === COMLINK.PORT_HANDOFF && event.ports[0]) {
     const port = event.ports[0];
     port.start();
+    httpuvDebugLog("sw-port-handoff");
+    // Confirm receipt before the Comlink round-trip, so the host can tell a
+    // handoff that never arrived from an R worker that is too busy to answer
+    // registerSwDelivery.
+    replyToMessageSource(event, { type: COMLINK.PORT_HANDOFF_ACK });
     // Soft roll: keep in-flight waitForRwasmHost() waiters alive across handoff.
     rollRwasmHostWaiter();
     void connectSwToWorker(port);

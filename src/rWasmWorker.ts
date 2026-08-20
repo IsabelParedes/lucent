@@ -3,7 +3,6 @@ import * as Comlink from "comlink";
 import { resolveLucentConfig } from "./config";
 import { isLucentDebug, lucentInfo } from "./debug";
 import {
-  evalR,
   initRModule,
   remountRHome,
   setEvalRPostFlush,
@@ -506,9 +505,9 @@ async function onMessage(event: MessageEvent): Promise<void> {
   switch (data.type) {
     case RWASM.EVAL: {
       try {
-        const module = await ensureRModule();
+        await ensureRModule();
         await tasks.enqueueRTask(() => {
-          evalR(module, String(data.code ?? ""));
+          tasks.evalRNow(String(data.code ?? ""));
         });
         replyOk(data.id);
         requestService();

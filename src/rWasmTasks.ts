@@ -1,10 +1,18 @@
 import { evalR, type RModule } from "./rWasmBootstrap";
 import type { HttpuvTransport } from "./transport";
 
-/** Thin R wrappers around shiny:: host-control APIs. */
+/**
+ * Thin R wrappers around shiny:: host-control APIs.
+ *
+ * Snippets that can run before the app starts must gate on `loadedNamespaces()`
+ * rather than `requireNamespace()` or a bare `shiny::`, both of which load the
+ * namespace. That load is a single synchronous evalR call lasting seconds (far
+ * longer under DevTools, where V8 drops wasm to Liftoff) during which the worker
+ * cannot answer the Comlink handshake or any httpuv request.
+ */
 export const SHINY_HOST = {
   stop: `tryCatch({
-  if (requireNamespace("shiny", quietly=TRUE) && shiny::isRunning()) {
+  if ("shiny" %in% loadedNamespaces() && shiny::isRunning()) {
     shiny::stopApp()
   }
 }, error=function(e) NULL)`,
@@ -16,15 +24,23 @@ export const SHINY_HOST = {
    * Module.evalR returns an SEXP pointer, not the R value — callers must read
    * the flag file for hadWork / nextMs. The host arms delays from nextMs on
    * SERVICE_STATUS (serviceOnce itself does not scheduleHostDelay).
+   *
+   * Before the app starts this reports idle in plain base R: a service tick must
+   * never be the thing that loads shiny.
    */
   serviceOnceHadWork: `tryCatch({
-  had <- isTRUE(shiny::serviceOnce())
-  next_ms <- tryCatch(shiny:::timerCallbacks$timeToNextEvent(), error=function(e) NA_real_)
-  jsonlite::write_json(list(
-    had = isTRUE(had),
-    nextMs = if (is.finite(next_ms)) next_ms else -1
-  ), "/tmp/lucent-service-had-work", auto_unbox=TRUE)
-  invisible(had)
+  if (!("shiny" %in% loadedNamespaces())) {
+    cat("0", file = "/tmp/lucent-service-had-work")
+    invisible(FALSE)
+  } else {
+    had <- isTRUE(shiny::serviceOnce())
+    next_ms <- tryCatch(shiny:::timerCallbacks$timeToNextEvent(), error=function(e) NA_real_)
+    jsonlite::write_json(list(
+      had = isTRUE(had),
+      nextMs = if (is.finite(next_ms)) next_ms else -1
+    ), "/tmp/lucent-service-had-work", auto_unbox=TRUE)
+    invisible(had)
+  }
 }, error=function(e) {
   tryCatch(jsonlite::write_json(list(had=FALSE, nextMs=-1, err=conditionMessage(e)), "/tmp/lucent-service-had-work", auto_unbox=TRUE), error=function(e2) NULL)
   invisible(FALSE)

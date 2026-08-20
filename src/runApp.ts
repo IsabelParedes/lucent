@@ -19,6 +19,7 @@ let rWorker: Worker | null = null;
 let rWorkerPromise: Promise<Worker> | null = null;
 let comlinkConnected = false;
 let comlinkPromise: Promise<void> | null = null;
+let comlinkHandshakeInFlight = false;
 let swRegistrationPromise: Promise<ServiceWorkerRegistration | null> | null = null;
 let httpuvReadyPromise: Promise<void> | null = null;
 let evalSeq = 0;
@@ -424,28 +425,58 @@ async function ensureRWorker(): Promise<Worker> {
   return rWorkerPromise;
 }
 
-async function ensureComlinkConnected(): Promise<void> {
-  if (comlinkConnected && comlinkPromise) {
+/**
+ * Establish the host <-> service worker <-> R worker Comlink link, coalescing
+ * every caller onto a single handshake.
+ *
+ * Two handshakes in flight at once are destructive: each COMLINK_PORT resets the
+ * worker's readiness flags, so the second handoff can clear the first one's
+ * delivery registration, and the host cannot tell the two acks apart. A
+ * controllerchange during boot used to start exactly such a competing handshake.
+ */
+function ensureComlinkConnected(): Promise<void> {
+  if (comlinkPromise && (comlinkConnected || comlinkHandshakeInFlight)) {
     return comlinkPromise;
   }
 
-  comlinkPromise = (async () => {
+  comlinkHandshakeInFlight = true;
+  const handshake = (async () => {
     lucentInfo("[runApp] Waiting for R worker and service worker…");
     const [worker] = await Promise.all([ensureRWorker(), ensureHttpuvServiceWorker()]);
     if (!navigator.serviceWorker.controller || !controllerMatchesExpectedScript()) {
       throw new Error("Service worker controller is not available");
     }
     lucentInfo("[runApp] Connecting Comlink…");
-    await connectHttpuvComlink(worker, requireTransport().COMLINK.PORT_HANDOFF);
+    const { COMLINK } = requireTransport();
+    await connectHttpuvComlink(worker, COMLINK.PORT_HANDOFF, {
+      ackType: COMLINK.PORT_HANDOFF_ACK,
+    });
     comlinkConnected = true;
   })();
 
-  return comlinkPromise;
+  const clearInFlight = (): void => {
+    comlinkHandshakeInFlight = false;
+  };
+  handshake.then(clearInFlight, clearInFlight);
+
+  comlinkPromise = handshake;
+  return handshake;
+}
+
+/**
+ * Force the next ensureHttpuvReady() to redo the handshake. An in-flight
+ * handshake is left in place as the coalescing target rather than raced.
+ */
+function invalidateComlink(): void {
+  comlinkConnected = false;
+  httpuvReadyPromise = null;
+  if (!comlinkHandshakeInFlight) {
+    comlinkPromise = null;
+  }
 }
 
 function reconnectComlinkAfterServiceWorkerUpdate(): void {
-  comlinkConnected = false;
-  comlinkPromise = null;
+  invalidateComlink();
   announceHostToServiceWorker();
   void ensureComlinkConnected().catch((err) => {
     console.warn("[httpuv] Comlink reconnect after service worker update failed:", err);
@@ -623,9 +654,7 @@ async function startShinyApp(): Promise<void> {
   await runApp();
   // Remount / SW activate can drop the worker link after the first handshake.
   // Re-assert Comlink before warmup so GET /shiny/ does not race PORT_HANDOFF.
-  comlinkConnected = false;
-  comlinkPromise = null;
-  httpuvReadyPromise = null;
+  invalidateComlink();
   await ensureHttpuvReady();
   await waitForShinyHttpReady(worker);
   loadViewerFrame();
@@ -663,11 +692,21 @@ function installHostServiceWorkerListeners(): void {
 }
 
 function installGlobalHelpers(): void {
-  (globalThis as unknown as { __lucent?: unknown }).__lucent = {
+  const lucent = {
     shinyUrl: (subpath = "") => appUrl(subpath),
     ensureHttpuvReady,
     stopRunningApp,
     enableHttpuvDebug: () => requireTransport().enableHttpuvDebug(),
+    /** Quick check that the worker responds. */
+    ping: () => lucent.evalR("1+1"),
+    async evalR(code: string): Promise<void> {
+      const worker = await ensureRWorker();
+      await postToRWorker(worker, {
+        type: RWASM.EVAL,
+        code,
+      });
+    },
+    startShinyApp: () => startShinyApp(),
     async testVirtualSocket(message = '{"method":"ping"}') {
       await ensureHttpuvReady();
       const controller = navigator.serviceWorker.controller;
@@ -720,6 +759,7 @@ function installGlobalHelpers(): void {
       return result;
     },
   };
+  (globalThis as unknown as { __lucent?: typeof lucent }).__lucent = lucent;
 }
 
 async function main(): Promise<void> {
@@ -733,7 +773,6 @@ async function main(): Promise<void> {
     lucentInfo("[runApp] httpuv debug tracing enabled (?httpuvDebug=1)");
   }
 
-  // Register the service worker while R.wasm boots (do not block on the worker).
   void ensureHttpuvServiceWorker().catch((err) => {
     console.error("[httpuv] Service worker setup failed:", err);
   });
