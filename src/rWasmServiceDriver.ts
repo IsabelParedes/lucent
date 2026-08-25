@@ -267,8 +267,8 @@ export function createServiceDriver(options: ServiceDriverOptions = {}): Service
     document.removeEventListener("visibilitychange", onVisibilityChange);
     if (worker) {
       worker.removeEventListener("message", onWorkerMessage);
+      worker = null;
     }
-    worker = null;
   }
 
   return { wake, scheduleDelay, attach, stop };

@@ -16,6 +16,8 @@ export const MSG = {
   HTTP_REQUEST: "httpuv_http_request",
   HTTP_RESPONSE: "httpuv_http_response",
   WS_PUSH: "httpuv_ws_push",
+  /** Iframe → SW (on session port): frame delivered to Shiny.createSocket. */
+  WS_PUSH_ACK: "httpuv_ws_push_ack",
   STOP: "httpuv_stop",
   /** Drop cached GET /shiny/ without tearing down the R worker (app restart). */
   CLEAR_APP_CACHE: "httpuv_clear_app_cache",

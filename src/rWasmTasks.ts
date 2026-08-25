@@ -34,6 +34,10 @@ export const SHINY_HOST = {
     invisible(FALSE)
   } else {
     had <- isTRUE(shiny::serviceOnce())
+    pending_flush <- tryCatch(shiny:::appsNeedingFlush$size() > 0, error=function(e) FALSE)
+    if (isTRUE(pending_flush)) {
+      had <- TRUE
+    }
     next_ms <- tryCatch(shiny:::timerCallbacks$timeToNextEvent(), error=function(e) NA_real_)
     jsonlite::write_json(list(
       had = isTRUE(had),

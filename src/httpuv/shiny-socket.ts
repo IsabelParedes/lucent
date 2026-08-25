@@ -16,6 +16,9 @@ import { httpuvDebugLog } from "./debug";
 /** How long to wait for SESSION_ACK after REGISTER_SESSION. */
 const SESSION_REGISTER_TIMEOUT_MS = 5_000;
 
+/** After this gap with no SW→iframe push, the next send() force-registers. */
+const SESSION_PORT_STALE_MS = 15_000;
+
 /** Build an absolute session URL under the Shiny app prefix. */
 function sessionUrl(action: string, opts: { handle?: string } = {}): string {
   const base = new URL("__session__/", location.href);
@@ -32,6 +35,7 @@ type SessionPortMessage = {
   wsType?: string;
   binary?: boolean;
   message?: unknown;
+  pushId?: number;
 };
 
 const socketsByHandle = new Map<string, VirtualShinySocket>();
@@ -50,6 +54,8 @@ export class VirtualShinySocket {
   private _active = false;
   private _port: MessagePort | null = null;
   private _registering: Promise<void> | null = null;
+  /** Last time a WS_PUSH arrived — used to detect orphaned ports after SW idle kill. */
+  private _lastPushAt = 0;
 
   onopen: ((event: Event) => void) | null = null;
   onmessage: ((event: MessageEvent) => void) | null = null;
@@ -92,9 +98,16 @@ export class VirtualShinySocket {
   /**
    * Ensure the SW has a live MessagePort for this session.
    * Safe to call repeatedly after idle SW restarts.
+   * @param force when true, replace any existing port (recovery / stale paths).
+   *   Ordinary rapid send() must not force — re-registering mid-flight drops
+   *   SW→iframe frames on Chromium. After idle, force once so a dead port
+   *   (SW stopped, client still holds MessagePort) is replaced before replies.
    */
-  ensurePort(): Promise<void> {
+  ensurePort(force = false): Promise<void> {
     if (!this._active || !this._handle) {
+      return Promise.resolve();
+    }
+    if (!force && this._port) {
       return Promise.resolve();
     }
     if (this._registering) {
@@ -152,6 +165,17 @@ export class VirtualShinySocket {
     await acked;
   }
 
+  private _ackPush(pushId: number | undefined): void {
+    if (typeof pushId !== "number" || !this._port) {
+      return;
+    }
+    try {
+      this._port.postMessage({ type: MSG.WS_PUSH_ACK, pushId });
+    } catch (err) {
+      console.warn("[shiny-socket] WS_PUSH_ACK failed", err);
+    }
+  }
+
   private _onPortMessage(event: MessageEvent<SessionPortMessage>): void {
     if (!this._active) {
       return;
@@ -179,6 +203,7 @@ export class VirtualShinySocket {
       } catch {
         // ignore malformed close payloads
       }
+      this._ackPush(data.pushId);
       this._finishClose(code, reason, true);
       return;
     }
@@ -209,12 +234,15 @@ export class VirtualShinySocket {
       payload = String(data.message ?? "");
     }
 
+    const bytes = typeof payload === "string" ? payload.length : payload.byteLength;
     httpuvDebugLog("socket-recv", {
       wsType,
       binary,
-      bytes: typeof payload === "string" ? payload.length : payload.byteLength,
+      bytes,
     });
+    this._lastPushAt = Date.now();
     this.onmessage?.(new MessageEvent("message", { data: payload }));
+    this._ackPush(data.pushId);
   }
 
   private _teardownPort(): void {
@@ -261,9 +289,14 @@ export class VirtualShinySocket {
       bytes: byteLen,
     });
 
-    // Re-attach the session port first so server replies are not queued forever
-    // after the browser stopped the SW during idle.
-    void this.ensurePort()
+    // After Chromium idle-stops the SW, this._port is orphaned but non-null.
+    // Force re-register once when we have been idle; keep the port stable during
+    // a reply storm (recent pushes keep _lastPushAt fresh).
+    const stale =
+      !this._port ||
+      !this._lastPushAt ||
+      Date.now() - this._lastPushAt > SESSION_PORT_STALE_MS;
+    void this.ensurePort(stale)
       .catch((err) => {
         console.warn("[shiny-socket] ensurePort before send failed", err);
       })
@@ -314,7 +347,7 @@ export class VirtualShinySocket {
 
 function reregisterAllSockets(): void {
   for (const sock of socketsByHandle.values()) {
-    void sock.ensurePort().catch((err) => {
+    void sock.ensurePort(true).catch((err) => {
       console.warn("[shiny-socket] ensurePort failed", err);
     });
   }
@@ -332,7 +365,7 @@ function installSessionPortRecovery(): void {
     const handle = data.handle ? String(data.handle) : "";
     const sock = handle ? socketsByHandle.get(handle) : undefined;
     if (sock) {
-      void sock.ensurePort().catch((err) => {
+      void sock.ensurePort(true).catch((err) => {
         console.warn("[shiny-socket] REQUEST_SESSION_PORT ensurePort failed", err);
       });
       return;
