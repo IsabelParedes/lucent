@@ -104,13 +104,25 @@ interface HostOutbound {
 async function connectSwToWorker(port: MessagePort): Promise<void> {
   const workerHost = Comlink.wrap<RHostApi>(port);
   const deliveryChannel = new MessageChannel();
+  // One-way WS push port: ordered postMessage without Comlink request/response
+  // (awaiting Comlink void hung Firefox; fire-and-forget raced Chromium).
+  const wsPushChannel = new MessageChannel();
   Comlink.expose(
     createSwDeliveryApi((msg) => handleHostOutboundMessage(msg as HostOutbound)),
     deliveryChannel.port1,
   );
+  wsPushChannel.port1.onmessage = (event: MessageEvent) => {
+    const msg = event.data as HostOutbound;
+    if (!msg || typeof msg !== "object" || typeof msg.type !== "string") {
+      return;
+    }
+    handleHostOutboundMessage(msg);
+  };
+  wsPushChannel.port1.start();
   try {
     await workerHost.registerSwDelivery(
       Comlink.transfer(deliveryChannel.port2, [deliveryChannel.port2]),
+      Comlink.transfer(wsPushChannel.port2, [wsPushChannel.port2]),
     );
     rwasmHost = workerHost;
     markRwasmHostReady();
@@ -215,8 +227,19 @@ const queuedWsPush = new Map<string, WsPushMsg[]>();
 /** Avoid spamming the client with re-register requests while one is in flight. */
 const sessionPortReregisterPending = new Set<string>();
 
+/** Serialize SW→iframe WS posts and wait for client ACK (Chromium drops flooded ports). */
+const sessionDeliverChain = new Map<string, Promise<void>>();
+const pendingSessionAcks = new Map<number, { resolve: () => void; reject: (e: Error) => void }>();
+let nextSessionPushId = 1;
+
+/** How long to wait for the iframe to ACK a WS_PUSH on the session port. */
+const SESSION_PUSH_ACK_TIMEOUT_MS = 8_000;
+
 /** Cached GET /shiny/ document so warmup and iframe do not each trigger a full R render. */
 let cachedAppDocument: PendingResponse | null = null;
+
+/** Bump when htmlwidget-deps-patch payload changes so SW cache cannot pin a stale inject. */
+const LUCENT_APP_PATCH_VERSION = "htmlwidget-async-v2";
 
 /** addResourcePath prefix -> VFS directory (e.g. shiny-plots -> /tmp/shiny-plots). */
 let shinyResourcePaths = new Map<string, string>();
@@ -464,7 +487,11 @@ function waitForHttpResponse(uuid: string, url: string, method: string): Promise
 function maybeCacheAppDocument(resp: PendingResponse, url: string, method: string): void {
   if (url && method === "GET" && isAppDocumentRequest(url) && resp.status === 200) {
     cachedAppDocument = clonePendingResponse(resp);
-    httpuvDebugLog("sw-app-cache-store", { url });
+    // Tag so we can detect stale caches after Lucent patch updates.
+    if (cachedAppDocument.headers) {
+      cachedAppDocument.headers["x-lucent-app-patch"] = LUCENT_APP_PATCH_VERSION;
+    }
+    httpuvDebugLog("sw-app-cache-store", { url, patch: LUCENT_APP_PATCH_VERSION });
   }
 }
 
@@ -528,7 +555,12 @@ function cloneWsMessage(message: unknown, binary: boolean): unknown {
   return message;
 }
 
-function postWsPushToPort(port: MessagePort, handle: string, msg: WsPushMsg): boolean {
+function postWsPushToPort(
+  port: MessagePort,
+  handle: string,
+  msg: WsPushMsg,
+  pushId: number,
+): boolean {
   const binary = Boolean(msg.binary);
   const payload = {
     type: MSG.WS_PUSH,
@@ -536,6 +568,7 @@ function postWsPushToPort(port: MessagePort, handle: string, msg: WsPushMsg): bo
     wsType: msg.wsType ?? WS_FRAME.SEND,
     binary,
     message: cloneWsMessage(msg.message ?? null, binary),
+    pushId,
   };
   try {
     // Structured clone only — never transfer. Transferring a buffer that Comlink
@@ -548,6 +581,48 @@ function postWsPushToPort(port: MessagePort, handle: string, msg: WsPushMsg): bo
   }
 }
 
+function rejectPendingSessionAcks(reason: string): void {
+  for (const [id, pending] of pendingSessionAcks) {
+    pendingSessionAcks.delete(id);
+    pending.reject(new Error(reason));
+  }
+}
+
+function waitForSessionPushAck(pushId: number): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingSessionAcks.delete(pushId);
+      reject(new Error(`session WS_PUSH_ACK timed out (id=${pushId})`));
+    }, SESSION_PUSH_ACK_TIMEOUT_MS);
+    pendingSessionAcks.set(pushId, {
+      resolve: () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      reject: (err: Error) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    });
+  });
+}
+
+function handleSessionPortInbound(key: string, event: MessageEvent): void {
+  const data = event.data as { type?: string; pushId?: number } | null;
+  if (!data || typeof data !== "object") {
+    return;
+  }
+  if (data.type === MSG.WS_PUSH_ACK && typeof data.pushId === "number") {
+    const pending = pendingSessionAcks.get(data.pushId);
+    if (pending) {
+      pendingSessionAcks.delete(data.pushId);
+      pending.resolve();
+    }
+    return;
+  }
+  httpuvDebugLog("sw-session-port-unknown", { handle: key, type: data.type });
+}
+
 function clearSessionPort(handle: string): void {
   const key = normalizeSessionHandle(handle);
   const port = sessionPorts.get(key);
@@ -555,7 +630,9 @@ function clearSessionPort(handle: string): void {
     return;
   }
   sessionPorts.delete(key);
+  rejectPendingSessionAcks(`session port cleared (${key})`);
   try {
+    port.onmessage = null;
     port.close();
   } catch {
     // ignore
@@ -568,31 +645,40 @@ function requestSessionPortReregister(handle: string): void {
   if (!key || sessionPortReregisterPending.has(key)) {
     return;
   }
-  const clientId = sessionClientIds.get(key);
-  if (!clientId) {
-    httpuvDebugLog("sw-session-reregister-no-client", { handle: key });
-    return;
-  }
   sessionPortReregisterPending.add(key);
-  void swSelf.clients
-    .get(clientId)
-    .then((client) => {
+  const storedClientId = sessionClientIds.get(key);
+  void (async () => {
+    try {
+      let client: Client | undefined;
+      if (storedClientId) {
+        client = await swSelf.clients.get(storedClientId);
+      }
       if (!client) {
-        httpuvDebugLog("sw-session-reregister-client-gone", { handle: key, clientId });
+        // After Chromium idle-stops the SW, sessionClientIds is empty — find the
+        // Shiny iframe (or any window) so REQUEST_SESSION_PORT still arrives.
+        const clients = await swSelf.clients.matchAll({
+          type: "window",
+          includeUncontrolled: true,
+        });
+        client =
+          clients.find((c) => isShinyAppClientUrl(c.url)) ??
+          clients.find((c) => !isShinyAppClientUrl(c.url)) ??
+          clients[0];
+      }
+      if (!client) {
+        httpuvDebugLog("sw-session-reregister-no-client", { handle: key });
         return;
       }
-      httpuvDebugLog("sw-session-reregister", { handle: key, clientId });
+      httpuvDebugLog("sw-session-reregister", { handle: key, clientId: client.id });
       client.postMessage({ type: MSG.REQUEST_SESSION_PORT, handle: key });
-    })
-    .catch((err: unknown) => {
+    } catch (err: unknown) {
       console.warn("[httpuv-sw] REQUEST_SESSION_PORT failed", err);
-    })
-    .finally(() => {
-      // Allow another nudge after a beat if the client never re-registered.
+    } finally {
       setTimeout(() => {
         sessionPortReregisterPending.delete(key);
       }, 2_000);
-    });
+    }
+  })();
 }
 
 function queueWsPush(key: string, msg: WsPushMsg): void {
@@ -612,20 +698,17 @@ function registerSessionPort(handle: string, port: MessagePort, clientId?: strin
   }
   sessionPortReregisterPending.delete(key);
   port.start();
+  port.onmessage = (event: MessageEvent) => {
+    handleSessionPortInbound(key, event);
+  };
   sessionPorts.set(key, port);
   httpuvDebugLog("sw-session-registered", { handle: key, clientId: sessionClientIds.get(key) });
 
   const queued = queuedWsPush.get(key);
   if (queued && queued.length > 0) {
     queuedWsPush.delete(key);
-    while (queued.length > 0) {
-      const next = queued[0]!;
-      if (!postWsPushToPort(port, key, next)) {
-        // Leave remaining frames queued; port stays registered for later pushes.
-        queuedWsPush.set(key, queued);
-        break;
-      }
-      queued.shift();
+    for (const next of queued) {
+      deliverWsPush(key, next);
     }
   }
 
@@ -637,45 +720,56 @@ function registerSessionPort(handle: string, port: MessagePort, clientId?: strin
   }
 }
 
-function deliverWsPush(handle: string, msg: WsPushMsg): void {
-  const key = normalizeSessionHandle(handle);
+/**
+ * Deliver one frame to the session port and wait for the iframe ACK.
+ * Chromium silently fails to deliver large frames when many postMessages
+ * are fired in one turn without backpressure.
+ */
+async function deliverWsPushOne(key: string, msg: WsPushMsg): Promise<void> {
   const port = sessionPorts.get(key);
-  httpuvDebugLog("sw-ws-push", {
-    handle: key,
-    wsType: msg.wsType,
-    messageLen: messageBodyLength(msg.message),
-    hasPort: Boolean(port),
-    queuedBefore: queuedWsPush.get(key)?.length ?? 0,
-  });
 
-  if (port) {
-    if (postWsPushToPort(port, key, msg)) {
-      // Also flush anything left from a partial register drain.
-      const queued = queuedWsPush.get(key);
-      if (queued && queued.length > 0) {
-        queuedWsPush.delete(key);
-        while (queued.length > 0) {
-          const next = queued[0]!;
-          if (!postWsPushToPort(port, key, next)) {
-            queuedWsPush.set(key, queued);
-            clearSessionPort(key);
-            requestSessionPortReregister(key);
-            break;
-          }
-          queued.shift();
-        }
-      }
-      return;
-    }
-    // Port looks dead (common after the browser stops the SW while idle).
+  if (!port) {
+    queueWsPush(key, msg);
+    requestSessionPortReregister(key);
+    return;
+  }
+
+  const pushId = nextSessionPushId++;
+  const ackPromise = waitForSessionPushAck(pushId);
+  if (!postWsPushToPort(port, key, msg, pushId)) {
+    pendingSessionAcks.delete(pushId);
     clearSessionPort(key);
     queueWsPush(key, msg);
     requestSessionPortReregister(key);
     return;
   }
 
-  queueWsPush(key, msg);
-  requestSessionPortReregister(key);
+  try {
+    await ackPromise;
+  } catch (err) {
+    console.warn("[httpuv-sw] session WS_PUSH_ACK failed; re-queueing frame", err);
+    // Do not drop the frame across port churn (ensurePort re-register races).
+    queueWsPush(key, msg);
+    requestSessionPortReregister(key);
+  }
+}
+
+function deliverWsPush(handle: string, msg: WsPushMsg): void {
+  const key = normalizeSessionHandle(handle);
+  httpuvDebugLog("sw-ws-push", {
+    handle: key,
+    wsType: msg.wsType,
+    messageLen: messageBodyLength(msg.message),
+    hasPort: Boolean(sessionPorts.get(key)),
+    queuedBefore: queuedWsPush.get(key)?.length ?? 0,
+  });
+  const prev = sessionDeliverChain.get(key) ?? Promise.resolve();
+  const next = prev
+    .then(() => deliverWsPushOne(key, msg))
+    .catch((err: unknown) => {
+      console.warn("[httpuv-sw] session deliver chain error", err);
+    });
+  sessionDeliverChain.set(key, next);
 }
 
 /** Legacy recv long-poll is retired; clients must REGISTER_SESSION. */
@@ -777,8 +871,25 @@ async function handleShinyFetch(event: FetchEvent): Promise<Response> {
     cachedAppDocument &&
     !bypassAppCache
   ) {
-    httpuvDebugLog("sw-app-cache-hit", { uuid, url: request.url });
-    return toFetchResponse(clonePendingResponse(cachedAppDocument));
+    const cachedPatch = cachedAppDocument.headers?.["x-lucent-app-patch"];
+    if (cachedPatch !== LUCENT_APP_PATCH_VERSION) {
+      httpuvDebugLog("sw-app-cache-stale", {
+        uuid,
+        cachedPatch: cachedPatch ?? null,
+        want: LUCENT_APP_PATCH_VERSION,
+      });
+      clearCachedAppDocument();
+    } else {
+      httpuvDebugLog("sw-app-cache-hit", { uuid, url: request.url });
+      // Re-apply latest HTML inject even on cache hit (strip+replace old script).
+      const refreshed = maybePatchAppDocumentResponse(
+        clonePendingResponse(cachedAppDocument),
+        request.url,
+        request.method,
+        isAppDocumentRequest,
+      );
+      return toFetchResponse(refreshed);
+    }
   }
 
   const staticRes = await tryServeShinyStaticAsset(request);
@@ -858,7 +969,10 @@ swSelf.addEventListener("fetch", (event) => {
             void requestComlinkFromHost();
           }
           const served = await tryServeLibRAsset(event.request);
-          return served ?? new Response("Not Found", { status: 404 });
+          if (!served) {
+            return new Response("Not Found", { status: 404 });
+          }
+          return served;
         })(),
       );
       return;

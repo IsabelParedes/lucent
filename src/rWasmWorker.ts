@@ -31,6 +31,8 @@ let transport: HttpuvTransport | null = null;
 let rModule: RModule | null = null;
 let rModulePromise: Promise<RModule> | null = null;
 let swDelivery: Comlink.Remote<SwDeliveryApi> | null = null;
+/** One-way port for WS pushes (ordered postMessage; no Comlink reply). */
+let wsPushPort: MessagePort | null = null;
 let rHostPortReady = false;
 let swDeliveryPortReady = false;
 
@@ -186,23 +188,33 @@ function deliverToServiceWorker(outbound: OutboundMessage, transfer: Transferabl
 
   if (outbound.type === t.MSG.WS_PUSH) {
     const handle = t.normalizeSessionHandle(outbound.handle);
-    const msg = {
-      handle,
-      binary: outbound.binary,
-      wsType: outbound.wsType,
-      message: outbound.message,
-    };
-    dbg("comlink-deliver-ws", {
+    dbg("ws-push", {
       handle,
       wsType: outbound.wsType,
       binary: outbound.binary,
       messageLen: messageBodyLength(outbound.message),
     });
-    void swDelivery
-      .deliverWsPush(transfer.length > 0 ? Comlink.transfer(msg, transfer) : msg)
-      .catch((err: unknown) => {
-        console.error("[rWasmWorker] deliverWsPush failed:", formatRWasmError(err), err);
-      });
+
+    if (!wsPushPort) {
+      console.warn("[rWasmWorker] WS push port not connected; dropping frame");
+      return;
+    }
+    const fullMsg = {
+      type: t.MSG.WS_PUSH,
+      handle,
+      binary: outbound.binary,
+      wsType: outbound.wsType,
+      message: outbound.message,
+    };
+    try {
+      if (transfer.length > 0) {
+        wsPushPort.postMessage(fullMsg, transfer);
+      } else {
+        wsPushPort.postMessage(fullMsg);
+      }
+    } catch (err: unknown) {
+      console.error("[rWasmWorker] wsPushPort.postMessage failed:", formatRWasmError(err), err);
+    }
   }
 }
 
@@ -457,8 +469,8 @@ function exposeRHost(port: MessagePort): void {
     getResourcePaths: () => getShinyResourcePaths(),
     readVfsFile: (vfsDir, suffix) => readVfsFile(vfsDir, suffix),
     readVfsFileAt: (vfsPath) => readVfsFileAtAsync(vfsPath),
-    registerSwDelivery: (deliveryPort) => {
-      connectSwDelivery(deliveryPort);
+    registerSwDelivery: (deliveryPort, pushPort) => {
+      connectSwDelivery(deliveryPort, pushPort);
     },
   });
   Comlink.expose(api, port);
@@ -466,10 +478,12 @@ function exposeRHost(port: MessagePort): void {
   lucentInfo("[rWasmWorker] Comlink: exposing unified host API");
 }
 
-function connectSwDelivery(port: MessagePort): void {
+function connectSwDelivery(port: MessagePort, pushPort: MessagePort): void {
   swDelivery = Comlink.wrap<SwDeliveryApi>(port);
+  wsPushPort = pushPort;
+  wsPushPort.start();
   swDeliveryPortReady = true;
-  lucentInfo("[rWasmWorker] Comlink: connected to SW delivery API");
+  lucentInfo("[rWasmWorker] Comlink: connected to SW delivery API (+ WS push port)");
   maybeAnnounceComlinkReady();
 }
 
@@ -493,6 +507,7 @@ async function onMessage(event: MessageEvent): Promise<void> {
     rHostPortReady = false;
     swDeliveryPortReady = false;
     swDelivery = null;
+    wsPushPort = null;
     await ensureRModule();
     exposeRHost(port);
     return;

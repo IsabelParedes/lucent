@@ -26,14 +26,15 @@ export interface RHostHandlers {
   onHttpRequest: (msg: HostInboundMessage) => void | Promise<void>;
   onStop: () => void;
   getResourcePaths: () => Promise<Record<string, string>>;
-  registerSwDelivery: (port: MessagePort) => void;
+  /** Comlink HTTP delivery port + one-way WS push port. */
+  registerSwDelivery: (port: MessagePort, wsPushPort: MessagePort) => void;
   readVfsFile: (vfsDir: string, suffix: string) => Promise<ArrayBuffer | null>;
   readVfsFileAt: (vfsPath: string) => Promise<ArrayBuffer | null>;
 }
 
 /** API the R worker exposes to the service worker (Comlink target). */
 export interface RHostApi {
-  registerSwDelivery(port: MessagePort): void | Promise<void>;
+  registerSwDelivery(port: MessagePort, wsPushPort: MessagePort): void | Promise<void>;
   deliverHttpRequest(req: HostHttpRequest): void | Promise<void>;
   getShinyResourcePaths(): Promise<Record<string, string>>;
   readVfsFile(vfsDir: string, suffix: string): Promise<ArrayBuffer | null>;
@@ -41,10 +42,9 @@ export interface RHostApi {
   stop(): void | Promise<void>;
 }
 
-/** Reverse delivery API the service worker exposes to the R worker (Comlink target). */
+/** Reverse delivery API the service worker exposes to the R worker (Comlink; HTTP only). */
 export interface SwDeliveryApi {
   deliverHttpResponse(resp: unknown): void | Promise<void>;
-  deliverWsPush(msg: unknown): void | Promise<void>;
 }
 
 /** Times the handoff is re-posted before giving up (needs `ackType`). */
@@ -249,8 +249,8 @@ export function createRHostApi(httpRequestType: string, handlers: RHostHandlers)
   const { onHttpRequest, onStop, getResourcePaths, registerSwDelivery, readVfsFile, readVfsFileAt } =
     handlers;
   return {
-    registerSwDelivery(port: MessagePort) {
-      registerSwDelivery(port);
+    registerSwDelivery(port: MessagePort, wsPushPort: MessagePort) {
+      registerSwDelivery(port, wsPushPort);
     },
     deliverHttpRequest(req: HostHttpRequest) {
       return onHttpRequest({

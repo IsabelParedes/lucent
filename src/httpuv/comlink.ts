@@ -9,22 +9,19 @@ export interface HttpResponsePayload {
   body?: ArrayBuffer | Uint8Array | string | null;
 }
 
-export interface WsPushPayload {
-  handle: string;
-  binary?: boolean;
-  wsType?: string;
-  message?: unknown;
-}
-
 /** API the service worker exposes to the R worker for outbound httpuv traffic. */
 export interface SwDeliveryApi {
+  /** HTTP only — WS pushes use a dedicated one-way MessagePort. */
   deliverHttpResponse(resp: HttpResponsePayload): void;
-  deliverWsPush(msg: WsPushPayload): void;
 }
 
 /** API the R worker exposes to the service worker for inbound httpuv traffic. */
 export interface RHostApi {
-  registerSwDelivery(port: MessagePort): void | Promise<void>;
+  /**
+   * @param port Comlink channel for HTTP responses
+   * @param wsPushPort one-way channel for WS pushes (ordered postMessage, no reply)
+   */
+  registerSwDelivery(port: MessagePort, wsPushPort: MessagePort): void | Promise<void>;
   deliverHttpRequest(req: unknown): Promise<void>;
   getShinyResourcePaths(): Promise<Record<string, string>>;
   readVfsFile(vfsDir: string, suffix: string): Promise<ArrayBuffer | null>;
@@ -45,15 +42,6 @@ export function createSwDeliveryApi(deliverOutbound: (msg: object) => void): SwD
         status: resp.status ?? 500,
         headers: resp.headers ?? {},
         body: resp.body ?? null,
-      });
-    },
-    deliverWsPush(msg: WsPushPayload) {
-      deliverOutbound({
-        type: MSG.WS_PUSH,
-        handle: msg.handle,
-        binary: msg.binary ?? false,
-        wsType: msg.wsType,
-        message: msg.message ?? null,
       });
     },
   };

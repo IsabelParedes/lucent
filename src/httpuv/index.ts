@@ -10,5 +10,4 @@ export type {
   RHostApi,
   SwDeliveryApi,
   HttpResponsePayload,
-  WsPushPayload,
 } from "./comlink";

@@ -1,28 +1,64 @@
 import type { PendingResponse } from "./types";
 
+/** Bump when the injected app-document script changes (invalidates SW HTML cache). */
+const LUCENT_PATCH_VERSION = "htmlwidget-async-v2";
+
 /**
- * Stock htmlwidgets calls Shiny.renderDependencies() then renderValue immediately.
- * That path jQuery-appends <script> tags, which uses sync XHR (jQuery._evalUrl).
- * Chromium service workers do not intercept sync XHR, so /lib/R/** JS 404s on
- * the HTTP server. renderDependenciesAsync uses document.head.append instead.
- *
- * The patch must also wrap bindings that already registered (plotly.js is not
- * named *-binding, so injecting at </head> is too late).
+ * Chromium SW does not intercept sync XHR (jQuery._evalUrl). When widgets load
+ * deps via async <script> tags, cache the bodies so a later sync _evalUrl can
+ * still eval them. Also prefer Shiny.renderDependenciesAsync over sync loads.
  */
 const HTMLWIDGET_ASYNC_DEPS_PATCH = `<script id="lucent-htmlwidget-async-deps">(function(){
+window.__lucentEvalCache=window.__lucentEvalCache||{};
+function cacheScript(url,text){
+  try{
+    var abs=new URL(url,document.baseURI).href;
+    window.__lucentEvalCache[abs]=text;
+    window.__lucentEvalCache[url]=text;
+  }catch(e){}
+}
+(function(){
+  var ofetch=window.fetch;
+  if(!ofetch)return;
+  var oAppend=Element.prototype.appendChild;
+  Element.prototype.appendChild=function(node){
+    if(node&&node.tagName==='SCRIPT'&&node.src){
+      var src=node.src;
+      ofetch(src).then(function(r){return r.ok?r.text():null;}).then(function(t){if(t)cacheScript(src,t);}).catch(function(){});
+    }
+    return oAppend.apply(this,arguments);
+  };
+})();
+function installEvalUrlPatch(){
+  if(!window.jQuery||!jQuery._evalUrl||jQuery._evalUrl.__lucentPatched)return;
+  var orig=jQuery._evalUrl;
+  jQuery._evalUrl=function(url,options,doc){
+    var abs;
+    try{abs=new URL(url,document.baseURI).href;}catch(e){abs=url;}
+    var cached=window.__lucentEvalCache[abs]||window.__lucentEvalCache[url];
+    if(typeof cached==='string'){
+      jQuery.globalEval(cached,options,doc);
+      return {status:200,responseText:cached};
+    }
+    return orig.apply(this,arguments);
+  };
+  jQuery._evalUrl.__lucentPatched=1;
+}
 function wrap(binding){
   if(!binding||!binding.renderValue||binding.__lucentAsyncDeps)return;
   binding.__lucentAsyncDeps=1;
+  try{
+    if(binding.renderValue.constructor&&binding.renderValue.constructor.name==='AsyncFunction')return;
+  }catch(e){}
   var rv=binding.renderValue.bind(binding);
   binding.renderValue=function(el,data){
-    if(data&&data.deps){
-      Shiny.renderDependenciesAsync(data.deps).then(function(){rv(el,data);});
-      return;
+    if(data&&data.x!=null&&data.deps&&data.deps.length){
+      return Shiny.renderDependenciesAsync(data.deps).then(function(){return rv(el,data);});
     }
-    rv(el,data);
+    return rv(el,data);
   };
 }
-function install(){
+function installBindingWrap(){
   if(!window.Shiny||!Shiny.outputBindings||!Shiny.renderDependenciesAsync)return;
   if(!Shiny.outputBindings.__lucentAsyncDepsReg){
     Shiny.outputBindings.__lucentAsyncDepsReg=1;
@@ -33,10 +69,16 @@ function install(){
     };
   }
   var list=Shiny.outputBindings.getBindings?Shiny.outputBindings.getBindings():[];
-  for(var i=0;i<list.length;i++) wrap(list[i].binding);
+  for(var i=0;i<list.length;i++){
+    wrap(list[i].binding||list[i]);
+  }
+}
+function install(){
+  installEvalUrlPatch();
+  installBindingWrap();
 }
 install();
-var n=0,t=setInterval(function(){install();if(++n>200)clearInterval(t);},5);
+var n=0,t=setInterval(function(){install();if(++n>400)clearInterval(t);},5);
 })();</script>`;
 
 function responseBodyToText(body: PendingResponse["body"]): string | null {
@@ -64,23 +106,24 @@ function isHtmlContentType(headers: Record<string, string> | undefined): boolean
 }
 
 export function injectHtmlwidgetAsyncDepsPatch(html: string): string {
-  if (html.includes('id="lucent-htmlwidget-async-deps"')) {
-    return html;
-  }
-  const shinyScript = html.match(/<script src="[^"]*\/shiny(?:\.min)?\.js"><\/script>/);
+  let out = html.replace(/<script id="lucent-htmlwidget-async-deps"[\s\S]*?<\/script>\s*/g, "");
+  const patch = HTMLWIDGET_ASYNC_DEPS_PATCH.replace(
+    'id="lucent-htmlwidget-async-deps"',
+    `id="lucent-htmlwidget-async-deps" data-lucent-patch="${LUCENT_PATCH_VERSION}"`,
+  );
+  const shinyScript = out.match(/<script src="[^"]*\/shiny(?:\.min)?\.js"><\/script>/);
   if (shinyScript) {
-    return html.replace(shinyScript[0], `${shinyScript[0]}\n${HTMLWIDGET_ASYNC_DEPS_PATCH}`);
+    return out.replace(shinyScript[0], `${shinyScript[0]}\n${patch}`);
   }
-  if (html.includes("<head>")) {
-    return html.replace("<head>", `<head>\n${HTMLWIDGET_ASYNC_DEPS_PATCH}`);
+  if (out.includes("<head>")) {
+    return out.replace("<head>", `<head>\n${patch}`);
   }
-  if (html.includes("</head>")) {
-    return html.replace("</head>", `${HTMLWIDGET_ASYNC_DEPS_PATCH}\n</head>`);
+  if (out.includes("</head>")) {
+    return out.replace("</head>", `${patch}\n</head>`);
   }
-  return HTMLWIDGET_ASYNC_DEPS_PATCH + html;
+  return patch + out;
 }
 
-/** Patch live R-rendered app HTML so htmlwidgets await dependency scripts. */
 export function maybePatchAppDocumentResponse(
   resp: PendingResponse,
   url: string,
