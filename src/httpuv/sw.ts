@@ -375,6 +375,11 @@ function vfsStaticResponse(
     "Content-Type": mimeForAssetSuffix(suffix),
     "X-Httpuv-Static": source,
   });
+  // Plot PNGs overwrite a fixed VFS path; without no-store the browser can
+  // keep serving a prior response when ?v= collides across rapid updates.
+  if (suffix.toLowerCase().endsWith(".png") || source === "vfs") {
+    headers.set("Cache-Control", "no-store");
+  }
   if (method === "HEAD") {
     return new Response(null, { status: 200, headers });
   }

@@ -150,7 +150,7 @@ function bodyToText(body: unknown): string | null {
   if (Array.isArray(body)) {
     return new TextDecoder().decode(new Uint8Array(body));
   }
-  return String(body);
+  return null;
 }
 
 function maybeInjectShinySocketBootstrap(
@@ -159,12 +159,14 @@ function maybeInjectShinySocketBootstrap(
 ): string | ArrayBuffer | null {
   const contentType =
     Object.entries(headers).find(([key]) => key.toLowerCase() === "content-type")?.[1] ?? "";
+  // Decode httpuvRaw/base64 (and other wire formats) before HTML text injection.
+  const normalized = encodeResponseBody(body);
   if (!contentType.includes("text/html")) {
-    return encodeResponseBody(body);
+    return normalized;
   }
-  const html = bodyToText(body);
+  const html = bodyToText(normalized);
   if (!html) {
-    return encodeResponseBody(body);
+    return normalized;
   }
   return injectShinySocketBootstrap(html);
 }
