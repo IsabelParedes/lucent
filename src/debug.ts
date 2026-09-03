@@ -48,13 +48,11 @@ export function lucentInfo(...args: unknown[]): void {
   console.info(...args);
 }
 
-/** R worker log relay: errors always; routine R output only in debug mode. */
+/** R worker log relay: always forwarded to the console. */
 export function forwardRWorkerLog(level: "log" | "error", text: string): void {
   if (level === "error") {
     console.error(`[rWasmWorker] ${text}`);
     return;
   }
-  if (isLucentDebug()) {
-    console.log(`[rWasmWorker] ${text}`);
-  }
+  console.log(`[rWasmWorker] ${text}`);
 }
