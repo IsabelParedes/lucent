@@ -88,9 +88,7 @@ function log(level: "log" | "error", text: unknown): void {
     postToHost({ type: RWASM.LOG, level: "error", text: msg });
     return;
   }
-  if (isDebugEnabled()) {
-    postToHost({ type: RWASM.LOG, level: "log", text: msg });
-  }
+  postToHost({ type: RWASM.LOG, level: "log", text: msg });
 }
 
 function maybeAnnounceComlinkReady(): void {
