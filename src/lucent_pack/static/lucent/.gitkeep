@@ -1,1 +1,4 @@
-# Built Lucent JS assets (runApp.js, rWasmWorker.js, …) are copied here from js/dist on release.
+# Lucent JS bundles are built at release.
+#   ( cd js && npm ci && npm run build )
+#   mkdir -p src/lucent_pack/static/lucent/dist
+#   cp -a js/dist/* src/lucent_pack/static/lucent/dist/

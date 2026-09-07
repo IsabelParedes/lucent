@@ -29,14 +29,21 @@ dependencies:
 
 ## Development
 
+Requirements:
+- python
+- pip
+- nodejs
+
 ```bash
-# Python package
 pip install -e .
 
-# Browser runtime (TypeScript)
+# Browser runtime — required before `python -m build` (wheel)
 cd js && npm ci && npm run build
-# copy js/dist → src/lucent_pack/static/lucent/ (release step; not automated yet)
+mkdir -p ../src/lucent_pack/static/lucent/dist
+cp -a dist/. ../src/lucent_pack/static/lucent/dist/
 ```
+
+The hatch wheel hook fails the build if the bundles (`src/lucent_pack/static/lucent/dist/`) are missing.
 
 ## CLI
 
