@@ -92,9 +92,13 @@ def _cmd_build(args: argparse.Namespace) -> int:
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
-    from lucent_pack.serve import serve
+    from lucent_pack.serve import ServeError, serve
 
-    serve(directory=args.directory, port=args.port)
+    try:
+        serve(directory=args.directory, port=args.port)
+    except ServeError as exc:
+        print(f"lucent: error: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
