@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import html
 import shutil
 import subprocess
+from importlib.resources import as_file, files
 from pathlib import Path
 
 # VFS mount used by Lucent's startApp(appDir = "webApp", ...).
@@ -13,6 +15,16 @@ EMPACK_META_NAME = "empack_env_meta.json"
 
 RUNTIME_BIN_FILES = ("Rmain.js", "Rmain.wasm")
 RUNTIME_LIB_FILES = ("libR.so", "libRblas.so", "libRlapack.so")
+
+REQUIRED_LUCENT_DIST_FILES = (
+    "runApp.js",
+    "rWasmWorker.js",
+    "httpuv-web.js",
+    "httpuv-sw.js",
+    "shiny-socket.js",
+)
+
+SHELL_TEMPLATE_FILES = ("style.css", "favicon.svg")
 
 
 class BuildError(Exception):
@@ -32,7 +44,7 @@ def build(
     1. Validate the prefix (Rmain / libR*) and app directory
     2. Run empack pack env / pack dir / pack append into ``out_dir/packages/``
     3. Copy Rmain binaries and libR*.so into ``out_dir/runtime/``
-    4. Assemble Lucent JS, shell templates, SW alias, and app sources (separate task)
+    4. Assemble Lucent JS, shell templates, SW alias, and app sources
     """
     prefix_dir = prefix_dir.expanduser().resolve()
     app_dir = app_dir.expanduser().resolve()
@@ -59,8 +71,8 @@ def build(
     _log(f"packed packages → {packages_dir}")
     _log(f"copied runtime  → {runtime_dir}")
 
-    # Site shell / Lucent JS / SW alias — implemented in the assemble task.
     assemble_site(out_dir=out_dir, app_dir=app_dir, title=title)
+    _log(f"done → {out_dir}")
 
 
 def validate_prefix(prefix_dir: Path) -> None:
@@ -155,11 +167,57 @@ def copy_runtime(prefix_dir: Path, runtime_dir: Path) -> None:
 
 
 def assemble_site(*, out_dir: Path, app_dir: Path, title: str) -> None:
-    """Copy Lucent assets, shell templates, SW alias, and app sources into ``out_dir``."""
-    raise NotImplementedError(
-        "site assembly is not implemented yet "
-        f"(out_dir={out_dir}, app_dir={app_dir}, title={title!r})"
+    """Copy Lucent assets, shell templates, SW alias, and app sources into ``out_dir``.
+
+    Expects ``out_dir/packages`` and ``out_dir/runtime`` to already exist from packing.
+    """
+    _log("assembling site shell and Lucent assets")
+
+    lucent_dist = files("lucent_pack").joinpath("static", "lucent", "dist")
+    missing = [name for name in REQUIRED_LUCENT_DIST_FILES if not lucent_dist.joinpath(name).is_file()]
+    if missing:
+        raise BuildError(
+            "bundled Lucent browser assets are missing from the package. "
+            f"Missing: {', '.join(missing)}. "
+            "Build them into src/lucent_pack/static/lucent/dist/ "
+            "(see README Development), or install a released lucent-pack wheel."
+        )
+
+    dist_dest = out_dir / "lucent" / "dist"
+    with as_file(lucent_dist) as dist_src:
+        if dist_dest.exists():
+            shutil.rmtree(dist_dest)
+        shutil.copytree(dist_src, dist_dest)
+
+    sw_src = dist_dest / "httpuv-sw.js"
+    shutil.copy2(sw_src, out_dir / "httpuv-sw.js")
+    sw_map = dist_dest / "httpuv-sw.js.map"
+    if sw_map.is_file():
+        shutil.copy2(sw_map, out_dir / "httpuv-sw.js.map")
+
+    templates = files("lucent_pack").joinpath("templates")
+    index_src = templates.joinpath("index.html")
+    if not index_src.is_file():
+        raise BuildError("package is missing templates/index.html")
+    index_html = index_src.read_text(encoding="utf-8")
+    (out_dir / "index.html").write_text(
+        index_html.replace("{{ title }}", html.escape(title)),
+        encoding="utf-8",
     )
+
+    for name in SHELL_TEMPLATE_FILES:
+        asset = templates.joinpath(name)
+        if not asset.is_file():
+            raise BuildError(f"package is missing templates/{name}")
+        (out_dir / name).write_bytes(asset.read_bytes())
+
+    webapp_dest = out_dir / "webApp"
+    if webapp_dest.exists():
+        shutil.rmtree(webapp_dest)
+    # Follow symlinks inside the app tree (same idea as prepare-pages.sh `cp -aL`).
+    shutil.copytree(app_dir, webapp_dest, symlinks=False)
+
+    _log("wrote index.html, style.css, favicon.svg, lucent/dist/, httpuv-sw.js, webApp/")
 
 
 def _empack_executable() -> str:
