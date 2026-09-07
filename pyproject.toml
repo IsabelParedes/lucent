@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lucent-pack"
+version = "0.1.0"
+description = "Pack a Shiny app and a WebAssembly R environment into a static Lucent site"
+readme = "README.md"
+license = "BSD-3-Clause"
+requires-python = ">=3.10"
+authors = [{ name = "Isabel Paredes" }]
+keywords = ["shiny", "wasm", "emscripten", "r", "lucent"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: BSD License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Build Tools",
+]
+dependencies = [
+  "empack>=6,<7",
+]
+
+[project.urls]
+Homepage = "https://github.com/IsabelParedes/lucent-pack"
+Repository = "https://github.com/IsabelParedes/lucent-pack"
+
+[project.scripts]
+lucent = "lucent_pack.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lucent_pack"]
+
+# Non-.py package data (shell templates + bundled Lucent JS).
+[tool.hatch.build.targets.wheel.force-include]
+"src/lucent_pack/templates" = "lucent_pack/templates"
+"src/lucent_pack/static" = "lucent_pack/static"
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/js",
+  "/README.md",
+  "/LICENSE",
+  "/pyproject.toml",
+]

@@ -1,0 +1,72 @@
+/* Lucent CSS */
+
+:root {
+  --background: #1e1e2e;
+  --text: #cdd6f4;
+  --text-error: #f38ba8;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --background: #fafafa;
+    --text: #1e1e2e;
+    --text-error:#e7225a;
+  }
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  background: var(--background);
+  color: var(--text);
+}
+
+.boot-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  background: var(--background);
+  color: var(--text);
+}
+
+.boot-overlay[hidden] {
+  display: none;
+}
+
+.boot-overlay h3 {
+  margin: 0;
+  font-weight: 600;
+}
+
+.boot-overlay progress {
+  width: min(400px, 80vw);
+  height: 0.85rem;
+}
+
+.boot-overlay--error #status {
+  color: var(--text-error);
+}
+
+.app-layout {
+  flex: 1 1 auto;
+  display: flex;
+  min-height: 0;
+}
+
+.app-frame {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  border: none;
+}

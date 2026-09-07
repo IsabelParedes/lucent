@@ -284,7 +284,7 @@ async function populateFromEmpack(
   }
   onBootStatus?.({
     phase: "download",
-    message: "Downloading packages…",
+    message: "Loading packages…",
     percent: 5,
   });
   lucentInfo("[rWasm] populateFilesystem", empackMetaUrl);
