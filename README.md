@@ -1,15 +1,21 @@
-# Pack a Shiny app and a WebAssembly R environment into a static [Lucent](js/) site.
+# Lucent-Pack
+
+Pack a Shiny app and a WebAssembly R environment into a static site.
+
+## Installation
 
 ```bash
-pip install -e .
-lucent build --prefix-dir ./_prefix-wasm --app ./app --outdir ./_site
-lucent serve _site
+pip install lucent-pack
+# OR
+micromamba install lucent-pack
 ```
 
-Create a wasm environment with your favorite package manager:
+## Usage
+
+1. Create a wasm environment with your favorite package manager.
 
 ```bash
-micromamba create -p ./_prefix-wasm -f environment.yaml --platform=emscripten-wasm32
+micromamba create -f environment.yaml --platform=emscripten-wasm32
 ```
 
 ```yaml
@@ -25,6 +31,17 @@ dependencies:
 # Any additional packages required for the app
 - r-bslib
 - r-plotly
+```
+
+2. Build the site.
+
+```bash
+lucent build --prefix-dir /path/to/wasm/env/ --app /path/to/app --outdir ./_site
+```
+
+3. Check results.
+```bash
+lucent serve ./_site # the output directory
 ```
 
 ## Development
