@@ -37,7 +37,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Shiny app directory (mounted at /webApp in the VFS)",
     )
     build.add_argument(
-        "--out",
+        "--outdir",
         type=Path,
         default=Path("_site"),
         help="Output directory for the static site (default: _site)",
@@ -76,14 +76,18 @@ def _package_version() -> str:
 
 
 def _cmd_build(args: argparse.Namespace) -> int:
-    from lucent_pack.build import build
+    from lucent_pack.build import BuildError, build
 
-    build(
-        prefix_dir=args.prefix_dir,
-        app_dir=args.app,
-        out_dir=args.out,
-        title=args.title,
-    )
+    try:
+        build(
+            prefix_dir=args.prefix_dir,
+            app_dir=args.app,
+            out_dir=args.outdir,
+            title=args.title,
+        )
+    except BuildError as exc:
+        print(f"lucent: error: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 

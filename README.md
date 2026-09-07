@@ -2,7 +2,7 @@
 
 ```bash
 pip install -e .
-lucent build --prefix-dir ./_prefix-wasm --app ./app --out ./_site
+lucent build --prefix-dir ./_prefix-wasm --app ./app --outdir ./_site
 lucent serve _site
 ```
 
@@ -49,5 +49,5 @@ The hatch wheel hook fails the build if the bundles (`src/lucent_pack/static/luc
 
 | Command | Purpose |
 |---------|---------|
-| `lucent build` | Pack an existing `--prefix-dir` + `--app` into `--out` |
+| `lucent build` | Pack an existing `--prefix-dir` + `--app` into `--outdir` |
 | `lucent serve` | Serve a built site directory (`python -m http.server` style) |
