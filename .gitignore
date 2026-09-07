@@ -1,3 +1,25 @@
-node_modules/
-dist/
+# JS toolchain / build outputs
+js/node_modules/
+js/dist/
+src/lucent_pack/static/lucent/dist/
 *.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+.venv/
+venv/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+
+# Local wasm / pack outputs
+_prefix-wasm/
+_site/
+packages/
+runtime/

@@ -1,0 +1,54 @@
+name: Build Wheel
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash -el {0}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install micromamba
+        uses: mamba-org/setup-micromamba@v3
+        with:
+          environment-name: ci-env
+          create-args: >-
+            python
+            pip
+            python-build
+            nodejs
+          init-shell: bash
+
+      - name: Build Lucent JS
+        working-directory: js
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+          mkdir -p ../src/lucent_pack/static/lucent/dist
+          cp -a dist/. ../src/lucent_pack/static/lucent/dist/
+
+      - name: Build wheel
+        run: |
+          set -euo pipefail
+          python -m build --wheel
+          ls -la dist/*.whl
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: lucent-pack-wheel
+          path: dist/*.whl
+          if-no-files-found: error

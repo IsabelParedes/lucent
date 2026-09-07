@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }}</title>
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+
+    <div id="boot-overlay" class="boot-overlay" aria-live="polite">
+      <h3 id="boot-title">Starting</h3>
+      <progress id="progress" value="0" max="100"></progress>
+      <div id="status">Starting…</div>
+    </div>
+
+    <main class="app-layout">
+        <iframe
+          id="app-frame"
+          class="app-frame"
+          title="Viewer"
+          sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads allow-popups-to-escape-sandbox"
+        ></iframe>
+    </main>
+    <script>
+      // Resolve against the site root so project GitHub Pages mounts
+      // (username.github.io/repo/) work without absolute "/..." paths.
+      const siteRoot = new URL("./", window.location.href);
+      globalThis.__LUCENT__ = {
+        transportBaseUrl: new URL("lucent/dist/", siteRoot).href,
+        serviceWorkerUrl: new URL("httpuv-sw.js", siteRoot).href,
+        rRuntimeBaseUrl: new URL("runtime/", siteRoot).href,
+        empackMetaUrl: new URL("packages/empack_env_meta.json", siteRoot).href,
+        empackPackagesBaseUrl: new URL("packages/", siteRoot).href,
+        shinyBaseUrl: siteRoot.href,
+      };
+
+      const title = document.getElementById("boot-title");
+      const progress = document.getElementById("progress");
+      const status = document.getElementById("status");
+      const overlay = document.getElementById("boot-overlay");
+
+      const PHASE_TITLES = {
+        "load-runtime": "Loading runtime",
+        download: "Loading packages",
+        filesystem: "Preparing filesystem",
+        "init-r": "Initializing R",
+        "load-httpuv": "Loading packages",
+        "start-app": "Starting Shiny",
+        warmup: "Warming up",
+      };
+
+      // Map download % into the overall boot bar (download is ~5–60%).
+      function downloadOverallPercent(downloadPercent) {
+        if (downloadPercent == null) return null;
+        return 5 + (downloadPercent / 100) * 55;
+      }
+
+      window.addEventListener("lucent:boot-status", (event) => {
+        const { phase, message, percent } = event.detail;
+        title.textContent = PHASE_TITLES[phase] ?? "Starting";
+        status.textContent = message;
+        if (percent != null) {
+          progress.value = percent;
+        }
+      });
+
+      window.addEventListener("lucent:download-progress", (event) => {
+        const { percent, downloadedBytes, totalBytes } = event.detail;
+        title.textContent = PHASE_TITLES.download;
+        const overall = downloadOverallPercent(percent);
+        if (overall != null) {
+          progress.value = overall;
+        }
+        status.textContent =
+          `Loading packages… ${(downloadedBytes / 1024 / 1024).toFixed(1)} MB / ` +
+          `${(totalBytes / 1024 / 1024).toFixed(1)} MB ` +
+          `(${percent == null ? "?" : percent.toFixed(1)}%)`;
+      });
+
+      window.addEventListener("lucent:ready", () => {
+        title.textContent = "Ready";
+        progress.value = 100;
+        status.textContent = "Ready";
+        overlay.hidden = true;
+      });
+
+      window.addEventListener("lucent:error", (event) => {
+        status.textContent = `Error: ${event.detail?.message ?? "failed to start"}`;
+        overlay.classList.add("boot-overlay--error");
+      });
+    </script>
+    <script type="module" src="./lucent/dist/runApp.js"></script>
+  </body>
+</html>
